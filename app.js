@@ -90,6 +90,7 @@ const App = (() => {
   const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
   const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
   const TIP_RESET_STORAGE_KEY = "tienda_napoles_tip_reset_invoices_v1";
+  const OFFLINE_ADMIN_SNAPSHOT_KEY = "los_anos_offline_admin_snapshot_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
   const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
@@ -936,6 +937,27 @@ const App = (() => {
     state.pwaRegistrationPromise = navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
       .catch(() => null);
     return state.pwaRegistrationPromise;
+  };
+
+  const readOfflineAdminSnapshot = () => {
+    try {
+      const snapshot = JSON.parse(localStorage.getItem(OFFLINE_ADMIN_SNAPSHOT_KEY) || "null");
+      return Array.isArray(snapshot?.sessions) && Array.isArray(snapshot?.requests) ? snapshot : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const persistOfflineAdminSnapshot = () => {
+    try {
+      localStorage.setItem(OFFLINE_ADMIN_SNAPSHOT_KEY, JSON.stringify({
+        sessions: state.sessions,
+        requests: state.requests,
+        updatedAt: new Date().toISOString()
+      }));
+    } catch (_) {
+      // La aplicación sigue operativa; la cola del service worker conserva escrituras pendientes.
+    }
   };
 
   const flushOfflineQueue = () => {
@@ -3393,6 +3415,7 @@ const App = (() => {
   };
 
   const loadAdminData = async () => {
+    const cachedSnapshot = readOfflineAdminSnapshot();
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
@@ -3407,8 +3430,14 @@ const App = (() => {
           []
         )
       ]);
+      if (cachedSnapshot && (!navigator.onLine || (!(requests || []).length && !(sessions || []).length))) {
+        state.requests = mergeOptimisticRequests(cachedSnapshot.requests);
+        state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions);
+        return false;
+      }
       state.requests = mergeOptimisticRequests(requests || []);
       state.sessions = mergeOptimisticSessions(sessions || []);
+      persistOfflineAdminSnapshot();
       return true;
     }
     const requests = mergeOptimisticRequests(snapshot.requests || []);
@@ -3426,6 +3455,7 @@ const App = (() => {
     state.adminSnapshotSignature = signature;
     state.requests = requests;
     state.sessions = sessions;
+    persistOfflineAdminSnapshot();
     return true;
   };
 

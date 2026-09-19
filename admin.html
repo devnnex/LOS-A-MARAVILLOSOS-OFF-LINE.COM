@@ -8,12 +8,11 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Admin - Servicio a la mesa</title>
-    <link rel="preconnect" href="https://unpkg.com">
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <link rel="stylesheet" href="style.css?v=20260919-tips-reset-warning-1">
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
     <audio id="alarmAudio" src="sound/alarm.mp3" preload="auto"></audio>
@@ -761,9 +760,9 @@
       </form>
     </dialog>
 
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="vendor/lucide.min.js"></script>
+    <script src="vendor/qrcode.min.js"></script>
+    <script src="vendor/jspdf.umd.min.js"></script>
     <script src="app.js?v=20260919-tips-reset-warning-1"></script>
   </body>
 </html>

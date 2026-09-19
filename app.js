@@ -938,6 +938,10 @@ const App = (() => {
     return state.pwaRegistrationPromise;
   };
 
+  const flushOfflineQueue = () => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE" });
+  };
+
   const waitForPwaController = async () => {
     if (!("serviceWorker" in navigator)) return false;
     if (navigator.serviceWorker.controller) return true;
@@ -8382,6 +8386,8 @@ const App = (() => {
   const init = async () => {
     state.page = document.body.dataset.page || "";
     void registerPwa();
+    navigator.serviceWorker?.ready.then(flushOfflineQueue).catch(() => undefined);
+    window.addEventListener("online", flushOfflineQueue);
     if (!connect()) {
       document.body.innerHTML = `
         <main class="setup-screen">

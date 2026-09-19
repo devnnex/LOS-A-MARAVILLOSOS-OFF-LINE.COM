@@ -1,5 +1,7 @@
 const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
+const OFFLINE_SYNC_PULSE_MS = 2500;
+const REMOTE_STORAGE_POLL_MS = 4000;
 
 const SUPABASE_CONFIG = {
   url: "https://zwguroyjngzrdbdwvzkg.supabase.co",
@@ -10,9 +12,9 @@ try { SUPABASE_CONFIG.url = new URL(String(SUPABASE_CONFIG.url || "").trim()).or
 
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycby0TL-s_LiNYjb6jfED08loJbMk9ppCBKw4DuM_ZOVNv1h2g48bnUf_UM883QQQo6nL/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbxMzNB5IrnCvJyuJGqbPC-f0NFMqYnTumJIWahelbMv0ubZzR4RCKheXjLFODj4Tl2L/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.6.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.7.0";
 
 const SupabaseDb = (() => {
   let authToken = "";
@@ -292,6 +294,7 @@ const App = (() => {
     lastPaidReceipt: null,
     appsScriptOutboxBusy: false,
     appsScriptOutboxTimer: null,
+    remoteStorageSyncBusy: false,
     alertFilter: "all",
     optimisticRequestStates: new Map(),
     optimisticSessionStates: new Map(),
@@ -317,6 +320,10 @@ const App = (() => {
     alarmStopTimer: null,
     adminPollTimer: null,
     adminSyncBusy: false,
+    coreSyncBusy: false,
+    localSupabaseWrites: 0,
+    offlineSyncTimer: null,
+    remoteStoragePollTimer: null,
     activeAdminSection: "dashboard",
     pwaBrandSignature: "",
     pwaBrandSyncToken: 0,
@@ -953,6 +960,9 @@ const App = (() => {
       localStorage.setItem(OFFLINE_ADMIN_SNAPSHOT_KEY, JSON.stringify({
         sessions: state.sessions,
         requests: state.requests,
+        removedSessions: Array.from(state.optimisticSessionStates.entries())
+          .filter(([, overlay]) => overlay.mode === "remove" && Date.now() < Number(overlay.retainUntil || 0))
+          .map(([id, overlay]) => ({ id, retainUntil: overlay.retainUntil })),
         updatedAt: new Date().toISOString()
       }));
     } catch (_) {
@@ -960,8 +970,41 @@ const App = (() => {
     }
   };
 
-  const flushOfflineQueue = () => {
-    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE" });
+  const flushOfflineQueue = (force = false) => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force });
+  };
+
+  const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) {
+      // Sin un worker controlador no es seguro adelantar Apps Script a una
+      // escritura de Supabase que todavia puede estar viajando por la red.
+      resolve({ pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
+      return;
+    }
+    const channel = new MessageChannel();
+    let finished = false;
+    const finish = (counts = {}) => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timer);
+      resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, ...counts });
+    };
+    const timer = window.setTimeout(() => finish({ pending: 1 }), timeoutMs);
+    channel.port1.onmessage = (event) => finish(event.data?.counts || {});
+    controller.postMessage({ type: "GET_OFFLINE_SYNC_STATUS" }, [channel.port2]);
+  });
+
+  const hasPendingSupabaseWrites = async () => {
+    if (state.localSupabaseWrites > 0) return true;
+    const counts = await getOfflineSyncStatus();
+    return Number(counts.pending || 0) + Number(counts.syncing || 0) > 0;
+  };
+
+  const startOfflineSyncPulse = () => {
+    window.clearInterval(state.offlineSyncTimer);
+    state.offlineSyncTimer = window.setInterval(flushOfflineQueue, OFFLINE_SYNC_PULSE_MS);
+    flushOfflineQueue();
   };
 
   const waitForPwaController = async () => {
@@ -1742,7 +1785,10 @@ const App = (() => {
       stock: Math.max(0, Number(meta.stock || 0)),
       minStock: Math.max(0, Number(meta.minStock ?? 5)),
       unit: meta.unit || "unidad",
-      updatedAt: meta.updatedAt || ""
+      updatedAt: meta.updatedAt || "",
+      version: meta.version === undefined || meta.version === null || meta.version === ""
+        ? null
+        : Math.max(0, Number(meta.version || 0))
     };
   };
 
@@ -1837,7 +1883,7 @@ const App = (() => {
     return true;
   };
 
-  const appsScriptRequest = async (action, payload = {}, timeoutMs = 25000) => {
+  const appsScriptRequest = async (action, payload = {}, timeoutMs = 4000, operationId = "") => {
     if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no esta configurado.");
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -1847,6 +1893,7 @@ const App = (() => {
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({
           action,
+          operationId,
           authToken: state.authToken,
           origin: location.origin,
           payload
@@ -1882,7 +1929,8 @@ const App = (() => {
       stock: inventory.stock,
       minStock: inventory.minStock,
       isAvailable: item.is_available !== false,
-      updatedAt: inventory.updatedAt || new Date().toISOString()
+      updatedAt: inventory.updatedAt || new Date().toISOString(),
+      version: inventory.version
     };
   };
 
@@ -1933,14 +1981,15 @@ const App = (() => {
   };
 
   const flushAppsScriptOutbox = async () => {
-    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
+    if (await hasPendingSupabaseWrites()) return false;
     state.appsScriptOutboxBusy = true;
     try {
       let jobs = readAppsScriptOutbox();
       while (jobs.length) {
         const job = jobs[0];
         setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
-        const result = await appsScriptRequest(job.action, job.payload);
+        const result = await appsScriptRequest(job.action, job.payload, 4000, job.id);
         const queuedAfterRequest = readAppsScriptOutbox();
         const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
         const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
@@ -2035,6 +2084,7 @@ const App = (() => {
 
   const syncInventoryWithAppsScript = async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (readAppsScriptOutbox().length || await hasPendingSupabaseWrites()) return false;
     try {
       const result = await appsScriptRequest("get_inventory");
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
@@ -2052,6 +2102,26 @@ const App = (() => {
       setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
       return false;
     }
+  };
+
+  const refreshRemoteStorageNow = async () => {
+    if (state.appsScriptOutboxBusy || state.remoteStorageSyncBusy || !isAppsScriptConfigured() || !state.currentUser) return false;
+    state.remoteStorageSyncBusy = true;
+    try {
+      if (readAppsScriptOutbox().length) return flushAppsScriptOutbox();
+      const synced = await syncInventoryWithAppsScript();
+      if (!synced) return false;
+      if (state.activeAdminSection === "movements") await loadInventoryMovements();
+      if (state.activeAdminSection === "income") await loadIncomeReport();
+      return true;
+    } finally {
+      state.remoteStorageSyncBusy = false;
+    }
+  };
+
+  const startRemoteStoragePolling = () => {
+    window.clearInterval(state.remoteStoragePollTimer);
+    state.remoteStoragePollTimer = window.setInterval(() => { void refreshRemoteStorageNow(); }, REMOTE_STORAGE_POLL_MS);
   };
 
   const queueInventoryUpsert = (item, movement = {}) => {
@@ -3022,6 +3092,10 @@ const App = (() => {
       .channel(`table:${state.currentTable.id}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refresh)
       .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages())
+      .on("postgres_changes", { event: "*", schema: "public", table: "business_settings" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "restaurant_tables" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_categories" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_items" }, () => void refreshCoreNow())
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         if (String(payload?.sessionId) === String(state.currentSession?.id) && payload?.role === "staff") setPeerTyping(payload.typing, "staff");
       })
@@ -3081,7 +3155,10 @@ const App = (() => {
     renderBillChat();
     renderAssistant();
     bindClient();
-    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self: false }, private: false } }).subscribe();
+    state.adminBroadcastChannel = state.sb
+      .channel("admin", { config: { broadcast: { self: false }, private: false } })
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
+      .subscribe();
     subscribeClient();
     setLoading(false);
     // La pantalla queda usable tras el bootstrap; la cuenta se hidrata en segundo plano.
@@ -3110,7 +3187,9 @@ const App = (() => {
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
         merged.delete(sessionId);
-        if (!serverSession) state.optimisticSessionStates.delete(sessionId);
+        if (!serverSession && Date.now() >= Number(overlay.retainUntil || 0)) {
+          state.optimisticSessionStates.delete(sessionId);
+        }
         return;
       }
       const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
@@ -3416,6 +3495,11 @@ const App = (() => {
 
   const loadAdminData = async () => {
     const cachedSnapshot = readOfflineAdminSnapshot();
+    (cachedSnapshot?.removedSessions || []).forEach((entry) => {
+      if (entry?.id && Date.now() < Number(entry.retainUntil || 0) && !state.optimisticSessionStates.has(entry.id)) {
+        state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
+      }
+    });
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
@@ -3457,6 +3541,23 @@ const App = (() => {
     state.sessions = sessions;
     persistOfflineAdminSnapshot();
     return true;
+  };
+
+  const refreshCoreNow = async () => {
+    if (state.coreSyncBusy || await hasPendingSupabaseWrites()) return false;
+    state.coreSyncBusy = true;
+    try {
+      await Promise.all([loadBusiness(), loadCore()]);
+      persistBootstrapCache();
+      if (state.page === "admin") renderAdmin();
+      else {
+        renderBrand();
+        renderMenu();
+      }
+      return true;
+    } finally {
+      state.coreSyncBusy = false;
+    }
   };
 
   const updateNavRequestBadge = () => {
@@ -4307,7 +4408,8 @@ const App = (() => {
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
-      const category = await db(state.sb.from("menu_categories").insert({ name: newCategory, is_active: true }).select("*").single(), null);
+      const newCategoryId = uid();
+      const category = await db(state.sb.from("menu_categories").insert({ id: newCategoryId, name: newCategory, is_active: true }).select("*").single(), null);
       if (!category) return;
       state.categories = [...state.categories, category];
       categoryId = category.id;
@@ -4321,9 +4423,15 @@ const App = (() => {
       is_available: form.is_available.checked,
       sort_order: state.items.find((item) => item.id === id)?.sort_order || 0
     };
-    const saved = await db(id
-      ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_items").insert(payload).select("*").single(), null);
+    const recordId = id || uid();
+    const existingItem = id ? state.items.find((item) => item.id === id) : null;
+    let saveQuery = id
+      ? state.sb.from("menu_items").update(payload).eq("id", id)
+      : state.sb.from("menu_items").insert({ ...payload, id: recordId });
+    if (id && existingItem?.updated_at && !existingItem._offline_pending) {
+      saveQuery = saveQuery.eq("updated_at", existingItem.updated_at);
+    }
+    const saved = await db(saveQuery.select("*").single(), null);
     if (!saved) return;
     const category = state.categories.find((entry) => entry.id === categoryId);
     const hydrated = { ...saved, menu_categories: category ? { name: category.name } : null };
@@ -4336,7 +4444,8 @@ const App = (() => {
       stock,
       minStock,
       unit: form.unit.value || "unidad",
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      version: previousInventory?.version ?? null
     };
     const beforeStock = Number(previousInventory?.stock || 0);
     const stockDelta = stock - beforeStock;
@@ -4416,7 +4525,12 @@ const App = (() => {
       updatedAt: new Date().toISOString()
     };
     persistInventoryStore();
-    enqueueAppsScriptJob("set_inventory_stock", { productId: item.id, stock: nextStock, updatedAt: state.inventoryMeta[id].updatedAt }, `inventory-stock:${item.id}`);
+    enqueueAppsScriptJob("set_inventory_stock", {
+      productId: item.id,
+      stock: nextStock,
+      updatedAt: state.inventoryMeta[id].updatedAt,
+      version: current.version
+    }, `inventory-stock:${item.id}`);
     $("#inventoryAdjustDialog")?.close();
     renderInventory();
     toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);
@@ -4757,6 +4871,7 @@ const App = (() => {
 
   const loadIncomeReport = async () => {
     if (!$("#income") || state.currentUser?.role !== "admin") return false;
+    if (state.incomeLoading) return false;
     const filters = incomeFiltersFromForm();
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
@@ -4769,7 +4884,7 @@ const App = (() => {
     setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
-      const result = await appsScriptRequest("get_income_report", { filters }, 40000);
+      const result = await appsScriptRequest("get_income_report", { filters }, 4000);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
@@ -4786,17 +4901,6 @@ const App = (() => {
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
     }
-  };
-
-  const waitForRemoteQueue = async () => {
-    const deadline = Date.now() + 30000;
-    while (state.appsScriptOutboxBusy && Date.now() < deadline) {
-      await new Promise((resolve) => window.setTimeout(resolve, 100));
-    }
-    if (state.appsScriptOutboxBusy) throw new Error("Hay cambios anteriores que todavía se están guardando. Intenta nuevamente en unos segundos.");
-    if (!readAppsScriptOutbox().length) return;
-    const synced = await flushAppsScriptOutbox();
-    if (!synced || readAppsScriptOutbox().length) throw new Error("No fue posible terminar de guardar los cambios anteriores.");
   };
 
   const resetSectionData = async (section) => {
@@ -4845,11 +4949,6 @@ const App = (() => {
 
     const button = $(`[data-reset-section="${section}"]`);
     const buttonMarkup = button?.innerHTML || "";
-    if (button) {
-      button.disabled = true;
-      button.classList.add("is-resetting");
-      button.innerHTML = `${icon("loader-circle", 17)} Eliminando...`;
-    }
 
     const snapshot = {
       items: state.items.map((item) => ({ ...item })),
@@ -4898,33 +4997,9 @@ const App = (() => {
         renderIncomeReport();
       }
 
-      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
-      if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no está configurado.");
-      await waitForRemoteQueue();
-      const result = await appsScriptRequest(settings.action, {}, 40000);
-      if (!result?.ok || result.cleared !== true) throw new Error(result?.error || "No fue posible completar el reinicio.");
-      if (section === "inventory") {
-        state.items = [];
-        state.inventoryMeta = {};
-        persistInventoryStore();
-        persistBootstrapCache();
-        renderInventory();
-        renderMenuManager();
-        setInventorySyncStatus("Inventario vacío y sincronizado", "synced", "cloud-check");
-      }
-      if (section === "movements") {
-        state.inventoryMovements = [];
-        persistInventoryMovements();
-        renderInventoryMovements();
-      }
-      if (section === "income") {
-        state.invoiceHistory = [];
-        state.lastPaidReceipt = null;
-        persistInvoiceHistory();
-        state.incomeReport = localIncomeReport(incomeFiltersFromForm());
-        renderIncomeReport();
-        setIncomeReportStatus("0 facturas", "ready", "badge-check");
-      }
+      enqueueAppsScriptJob(settings.action, {}, `reset:${section}:${uid()}`);
+      if (section === "inventory") setInventorySyncStatus("Reinicio pendiente de sincronizacion", "pending", "refresh-cw");
+      if (section === "income") setIncomeReportStatus("0 facturas · sincronizacion pendiente", "warning", "hard-drive");
       toast(settings.success, "ok", `reset-complete:${section}`);
     } catch (error) {
       if (section === "inventory") {
@@ -4999,8 +5074,6 @@ const App = (() => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) return;
     const reportBefore = state.incomeReport;
-    const invoicesBefore = [...state.invoiceHistory];
-    const inventoryBefore = JSON.parse(JSON.stringify(state.inventoryMeta));
     const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
     const updatedTotals = { ...(reportBefore.totals || {}) };
@@ -5033,24 +5106,8 @@ const App = (() => {
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    try {
-      if (!hadPendingSale || isAppsScriptConfigured()) {
-        const result = await appsScriptRequest("delete_sale", { saleId }, 40000);
-        if (!result?.ok) throw new Error(result?.error || "No se pudo eliminar la venta.");
-        if (Array.isArray(result?.items)) applyRemoteInventoryItems(result.items);
-      }
-      toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
-    } catch (error) {
-      state.incomeReport = reportBefore;
-      state.invoiceHistory = invoicesBefore;
-      state.inventoryMeta = inventoryBefore;
-      writeAppsScriptOutbox(outboxBefore);
-      persistInvoiceHistory();
-      persistInventoryStore();
-      renderIncomeReport();
-      renderInventory();
-      toast(String(error?.message || error), "error", `income-delete-failed:${saleId}`);
-    }
+    if (!hadPendingSale) enqueueAppsScriptJob("delete_sale", { saleId }, `sale-delete:${saleId}`);
+    toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
   const saveIncomeEdit = async (form) => {
@@ -5099,25 +5156,55 @@ const App = (() => {
       totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
       items
     };
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
-    try {
-      const result = await appsScriptRequest("edit_sale", { invoice: corrected }, 40000);
-      if (!result?.ok) throw new Error(result?.error || "No se pudo corregir la venta.");
-      const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
-      if (localIndex >= 0) {
-        state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
-        persistInvoiceHistory();
-      }
-      $("#incomeEditDialog")?.close();
-      state.incomeReport = null;
-      await loadIncomeReport();
-      toast("Venta corregida. El cambio quedo registrado en auditoria.", "ok", `income-edited:${record.saleId}`);
-    } catch (error) {
-      toast(String(error?.message || error), "error", `income-edit-failed:${record.saleId}`);
-    } finally {
-      if (submit) submit.disabled = false;
+    const jobs = readAppsScriptOutbox();
+    const pendingSaleIndex = jobs.findIndex((job) => job.action === "record_sale"
+      && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(record.saleId));
+    if (pendingSaleIndex >= 0) {
+      jobs[pendingSaleIndex] = {
+        ...jobs[pendingSaleIndex],
+        payload: { invoice: { ...jobs[pendingSaleIndex].payload.invoice, ...corrected } }
+      };
+      writeAppsScriptOutbox(jobs);
+      void flushAppsScriptOutbox();
+    } else {
+      enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}`);
     }
+    const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+    if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
+    else state.invoiceHistory.push(corrected);
+    persistInvoiceHistory();
+    const correctedCost = items.reduce((sum, item) => sum + Number(item.unit_cost || 0) * Number(item.quantity || 0), 0);
+    const correctedRecord = {
+      ...record,
+      table: corrected.table,
+      date: corrected.createdAt,
+      payer: corrected.payerName,
+      waiter: corrected.waiterName,
+      payments: corrected.payments,
+      isMixed: corrected.paymentMethod === "mixed",
+      reference: corrected.reference,
+      subtotal,
+      total,
+      cost: correctedCost,
+      profit: total - correctedCost,
+      items: corrected.items.map((item) => ({
+        lineId: item.id,
+        menuItemId: item.menu_item_id,
+        name: item.item_name,
+        quantity: item.quantity,
+        unitPrice: item.unit_price,
+        total: item.quantity * item.unit_price,
+        cost: item.quantity * item.unit_cost,
+        profit: item.quantity * (item.unit_price - item.unit_cost)
+      }))
+    };
+    state.incomeReport = {
+      ...state.incomeReport,
+      records: (state.incomeReport?.records || []).map((entry) => String(entry.saleId) === String(record.saleId) ? correctedRecord : entry)
+    };
+    $("#incomeEditDialog")?.close();
+    renderIncomeReport();
+    toast("Venta corregida. Se sincronizara automaticamente.", "ok", `income-edited:${record.saleId}`);
   };
 
   const exportIncomeCsv = () => {
@@ -5357,6 +5444,7 @@ const App = (() => {
   };
 
   const renderAdminLive = () => {
+    persistOfflineAdminSnapshot();
     renderAdminShell();
     renderAlerts();
     if (state.activeAdminSection === "dashboard" && tablesSignature() !== state.tableRenderSignature) renderTables();
@@ -5403,6 +5491,7 @@ const App = (() => {
       cover_url: form.cover_url.value.trim()
     };
     const original = state.business;
+    const businessRecordId = original?.id || uid();
     state.business = { ...(state.business || {}), ...payload };
     persistBootstrapCache();
     renderBrand();
@@ -5410,7 +5499,12 @@ const App = (() => {
     toast("Marca actualizada. El cliente ya vera esta personalizacion.");
     void (async () => {
       const saved = await retryQuiet(
-        () => state.sb.from("business_settings").upsert(payload, { onConflict: "is_primary" }).select("*").single(),
+        () => {
+          if (!original?.id) return state.sb.from("business_settings").insert({ ...payload, id: businessRecordId }).select("*").single();
+          let query = state.sb.from("business_settings").update(payload).eq("id", original.id);
+          if (original.updated_at && !original._offline_pending) query = query.eq("updated_at", original.updated_at);
+          return query.select("*").single();
+        },
         4
       );
       if (saved) {
@@ -5482,9 +5576,13 @@ const App = (() => {
     toast(isUpdate ? "Mesa actualizada. QR listo para descargar." : "Mesa guardada. QR listo para descargar.");
     void (async () => {
       const saved = await retryQuiet(
-        () => isUpdate
-          ? state.sb.from("restaurant_tables").update(payload).eq("id", recordId).select("*").single()
-          : state.sb.from("restaurant_tables").insert({ ...payload, id: recordId }).select("*").single(),
+        () => {
+          if (!isUpdate) return state.sb.from("restaurant_tables").insert({ ...payload, id: recordId }).select("*").single();
+          let query = state.sb.from("restaurant_tables").update(payload).eq("id", recordId);
+          const current = original.find((table) => table.id === recordId);
+          if (current?.updated_at && !current._offline_pending) query = query.eq("updated_at", current.updated_at);
+          return query.select("*").single();
+        },
         4
       );
       if (saved) {
@@ -5511,30 +5609,48 @@ const App = (() => {
       toast("La categoria necesita nombre.", "error");
       return;
     }
-    const id = form.category_id.value;
-    const query = id
-      ? state.sb.from("menu_categories").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_categories").insert(payload).select("*").single();
-    const saved = await db(query, null);
-    if (saved) {
-      form.reset();
-      form.category_id.value = "";
-      form.category_active.checked = true;
-      await loadCore();
+    const existingId = form.category_id.value;
+    const recordId = existingId || uid();
+    const existing = state.categories.find((category) => category.id === recordId) || null;
+    const original = [...state.categories];
+    const optimistic = { ...(existing || {}), ...payload, id: recordId, updated_at: new Date().toISOString(), _offline_pending: true };
+    state.categories = existing
+      ? state.categories.map((category) => category.id === recordId ? optimistic : category)
+      : [...state.categories, optimistic];
+    form.reset();
+    form.category_id.value = "";
+    form.category_active.checked = true;
+    persistBootstrapCache();
+    renderAdmin();
+    toast("Categoria guardada.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        if (!existing) return state.sb.from("menu_categories").insert({ ...payload, id: recordId }).select("*").single();
+        let query = state.sb.from("menu_categories").update(payload).eq("id", recordId);
+        if (existing.updated_at && !existing._offline_pending) query = query.eq("updated_at", existing.updated_at);
+        return query.select("*").single();
+      }, 4);
+      if (saved) {
+        state.categories = state.categories.map((category) => category.id === recordId ? saved : category);
+        persistBootstrapCache();
+        return;
+      }
+      state.categories = original;
+      persistBootstrapCache();
       renderAdmin();
-      toast("Categoria guardada.");
-    }
+      toast("No se pudo guardar la categoria. Se restauro la informacion.", "error", `category-save-failed:${recordId}`);
+    })();
   };
 
   const saveItem = async (form) => {
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
-      const category = await db(
-        state.sb.from("menu_categories").insert({ name: newCategory, is_active: true }).select("*").single(),
-        null
-      );
-      categoryId = category?.id || "";
+      categoryId = uid();
+      const localCategory = { id: categoryId, name: newCategory, sort_order: 0, is_active: true, updated_at: new Date().toISOString(), _offline_pending: true };
+      state.categories = [...state.categories, localCategory];
+      persistBootstrapCache();
+      void dbQuiet(state.sb.from("menu_categories").insert({ id: categoryId, name: newCategory, sort_order: 0, is_active: true }).select("*").single(), null);
     }
     const payload = {
       category_id: categoryId || null,
@@ -5549,19 +5665,47 @@ const App = (() => {
       toast("Producto y precio son obligatorios.", "error");
       return;
     }
-    const id = form.item_id.value;
-    const query = id
-      ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_items").insert(payload).select("*").single();
-    const saved = await db(query, null);
-    if (saved) {
-      form.reset();
-      form.item_id.value = "";
-      form.is_available.checked = true;
-      await loadCore();
+    const existingId = form.item_id.value;
+    const recordId = existingId || uid();
+    const existing = state.items.find((item) => item.id === recordId) || null;
+    const original = [...state.items];
+    const category = state.categories.find((entry) => entry.id === categoryId);
+    const optimistic = {
+      ...(existing || {}),
+      ...payload,
+      id: recordId,
+      menu_categories: category ? { name: category.name } : null,
+      updated_at: new Date().toISOString(),
+      _offline_pending: true
+    };
+    state.items = existing
+      ? state.items.map((item) => item.id === recordId ? optimistic : item)
+      : [...state.items, optimistic];
+    form.reset();
+    form.item_id.value = "";
+    form.is_available.checked = true;
+    persistBootstrapCache();
+    renderAdmin();
+    toast("Producto guardado.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        if (!existing) return state.sb.from("menu_items").insert({ ...payload, id: recordId }).select("*, menu_categories(name)").single();
+        let query = state.sb.from("menu_items").update(payload).eq("id", recordId);
+        if (existing.updated_at && !existing._offline_pending) query = query.eq("updated_at", existing.updated_at);
+        return query.select("*, menu_categories(name)").single();
+      }, 4);
+      if (saved) {
+        state.items = state.items.map((item) => item.id === recordId
+          ? { ...saved, menu_categories: saved.menu_categories || optimistic.menu_categories }
+          : item);
+        persistBootstrapCache();
+        return;
+      }
+      state.items = original;
+      persistBootstrapCache();
       renderAdmin();
-      toast("Producto guardado.");
-    }
+      toast("No se pudo guardar el producto. Se restauro la informacion.", "error", `item-save-failed:${recordId}`);
+    })();
   };
 
   const acknowledgeRequestOptimistically = (requestIds, payload, failureMessage) => {
@@ -5749,7 +5893,13 @@ const App = (() => {
     }
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
-    state.optimisticSessionStates.set(id, { mode: "remove", session });
+    state.optimisticSessionStates.set(id, {
+      mode: "remove",
+      session,
+      // Conserva la lapida durante varias lecturas para que una replica o una
+      // respuesta cacheada atrasada no haga reaparecer la cuenta ya cobrada.
+      retainUntil: Date.now() + 30_000
+    });
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
@@ -5778,7 +5928,11 @@ const App = (() => {
       toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
     }
-    state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
+    state.optimisticSessionStates.set(id, {
+      mode: "remove",
+      session: { ...session, ...saved },
+      retainUntil: Date.now() + 30_000
+    });
     await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
     return { session, saved, totals };
   };
@@ -6043,13 +6197,55 @@ const App = (() => {
     return { method, payments: [{ method: firstMethod, amount: firstAmount }, { method: secondMethod, amount: secondAmount }] };
   };
 
+  const reflectInvoiceInIncomeReport = (invoice) => {
+    const filters = incomeFiltersFromForm();
+    const localRecord = localIncomeRecords(filters)
+      .find((record) => String(record.saleId) === String(invoice.id || invoice.sessionId));
+    if (!localRecord) return;
+    if (!state.incomeReport) {
+      state.incomeReport = localIncomeReport(filters);
+      return;
+    }
+    const records = [
+      localRecord,
+      ...(state.incomeReport.records || []).filter((record) => String(record.saleId) !== String(localRecord.saleId))
+    ].sort((left, right) => String(right.date).localeCompare(String(left.date)));
+    state.incomeReport = {
+      ...state.incomeReport,
+      filters,
+      records,
+      totals: incomeTotalsFromRecords(records),
+      totalRecords: Math.max(Number(state.incomeReport.totalRecords || 0) + 1, records.length),
+      pendingCount: Number(state.incomeReport.pendingCount || 0) + 1
+    };
+  };
+
   const applyInvoiceToInventory = (invoice) => {
     if (state.invoiceHistory.some((entry) => entry.sessionId === invoice.sessionId)) return false;
     state.invoiceHistory.push(invoice);
     persistInvoiceHistory();
-    state.incomeReport = null;
+    reflectInvoiceInIncomeReport(invoice);
     enqueueAppsScriptJob("record_sale", { invoice }, `sale:${invoice.sessionId}`);
     return true;
+  };
+
+  const rollbackLocalPayment = ({ invoice, inventoryBefore, incomeReportBefore }) => {
+    const eventPrefix = `SALE-${invoice.id}-`;
+    state.invoiceHistory = state.invoiceHistory.filter((entry) => String(entry.id) !== String(invoice.id));
+    inventoryBefore.forEach((value, productId) => {
+      if (value === null) delete state.inventoryMeta[productId];
+      else state.inventoryMeta[productId] = value;
+    });
+    state.inventoryMovements = state.inventoryMovements.filter((movement) => !String(movement.movementId || "").startsWith(eventPrefix));
+    writeAppsScriptOutbox(readAppsScriptOutbox().filter((job) => job.dedupeKey !== `sale:${invoice.sessionId}`));
+    state.incomeReport = incomeReportBefore;
+    persistInvoiceHistory();
+    persistInventoryStore();
+    persistInventoryMovements();
+    renderInventory();
+    renderInventoryMovements();
+    renderIncomeReport();
+    renderTips();
   };
 
   const paidInventoryPlan = (session) => {
@@ -6122,6 +6318,12 @@ const App = (() => {
       toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
       return;
     }
+    if (state.invoiceHistory.some((invoice) => String(invoice.sessionId) === String(session.id))) {
+      $("#paymentDialog")?.close();
+      void closeSession(session.id);
+      toast("Esta cuenta ya fue cobrada. Se retiro la copia atrasada de la pantalla.", "ok", `payment-already-recorded:${session.id}`);
+      return;
+    }
     if (tipsEnabled() && !form.tip_choice?.value) {
       toast("Selecciona si el cliente paga con o sin propina.", "error", "tip-choice-required");
       form.querySelector('input[name="tip_choice"]')?.focus({ preventScroll: true });
@@ -6149,22 +6351,16 @@ const App = (() => {
       state.paymentProcessing = false;
       return;
     }
-    const closed = await closeSession(session.id);
-    buttons.forEach((button) => { button.disabled = false; });
-    if (!closed) {
-      receiptWindow?.close();
-      state.paymentProcessing = false;
-      return;
-    }
-    const createdAt = closed.saved.closed_at || new Date().toISOString();
+    const createdAt = new Date().toISOString();
+    const totals = sessionTotals(session);
     const manualTip = tipsEnabled() && form.tip_choice.value === "with" ? currencyInputNumber(form.tip_amount) : 0;
     const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" && !manualTip ? Number(state.tipSettings.percentage) : 0;
-    const tipAmount = manualTip || (tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0);
+    const tipAmount = manualTip || (tipPercentage ? tipAmountFor(totals.total, tipPercentage) : 0);
     const invoiceTotals = {
-      ...closed.totals,
-      baseTotal: integerMoney(closed.totals.total),
+      ...totals,
+      baseTotal: integerMoney(totals.total),
       tip: tipAmount,
-      total: integerMoney(closed.totals.total) + tipAmount
+      total: integerMoney(totals.total) + tipAmount
     };
     const invoice = {
       id: uid(),
@@ -6183,7 +6379,7 @@ const App = (() => {
       tipPercentage,
       tipAmount,
       tipIsManual: manualTip > 0,
-      baseTotal: integerMoney(closed.totals.total),
+      baseTotal: integerMoney(totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
       changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - invoiceTotals.total : 0,
@@ -6199,14 +6395,42 @@ const App = (() => {
         status: item.status
       }))
     };
+    const inventoryBefore = new Map(inventoryPlan.map(({ item }) => [
+      item.id,
+      Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id)
+        ? { ...state.inventoryMeta[item.id] }
+        : null
+    ]));
+    const incomeReportBefore = state.incomeReport;
+
+    // Desde aqui todo lo visible cambia en el mismo click. La confirmacion de
+    // Supabase sigue en segundo plano y Apps Script espera esa escritura.
+    state.localSupabaseWrites += 1;
+    const closePromise = closeSession(session.id);
     applyPaidInventoryLocally(invoice, inventoryPlan);
     applyInvoiceToInventory(invoice);
     $("#paymentDialog")?.close();
     renderInventory();
+    renderInventoryMovements();
+    renderIncomeReport();
     renderTips();
+    buttons.forEach((button) => { button.disabled = false; });
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
+
+    let closed = null;
+    try {
+      closed = await closePromise;
+    } finally {
+      state.localSupabaseWrites = Math.max(0, state.localSupabaseWrites - 1);
+    }
+    if (!closed) {
+      receiptWindow?.close();
+      rollbackLocalPayment({ invoice, inventoryBefore, incomeReportBefore });
+      return;
+    }
+    void flushAppsScriptOutbox();
   };
 
   const renderConsumptionSelection = () => {
@@ -7147,13 +7371,18 @@ const App = (() => {
       menu_items: "items"
     }[table];
     const original = property ? state[property] : null;
+    const originalRow = original?.find((entry) => entry.id === id) || null;
     if (property) state[property] = state[property].filter((entry) => entry.id !== id);
     if (property) persistBootstrapCache();
     if (quickServicePointDelete) renderServicePoints();
     else renderAdmin();
     void (async () => {
       const removed = await retryQuiet(
-        () => state.sb.from(table).delete().eq("id", id).select("*").single(),
+        () => {
+          let query = state.sb.from(table).delete().eq("id", id);
+          if (originalRow?.updated_at && !originalRow._offline_pending) query = query.eq("updated_at", originalRow.updated_at);
+          return query.select("*").single();
+        },
         4
       );
       if (removed) {
@@ -7674,9 +7903,14 @@ const App = (() => {
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "business_settings" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "restaurant_tables" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_categories" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_items" }, () => void refreshCoreNow())
       .subscribe((status) => {
         if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -8409,7 +8643,8 @@ const App = (() => {
     showAdminSection(initialSection);
     renderTableFormQr();
     initRemoteStorage();
-    window.addEventListener("online", flushAppsScriptOutbox);
+    startRemoteStoragePolling();
+    window.addEventListener("online", () => { void refreshRemoteStorageNow(); });
     startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
@@ -8423,13 +8658,28 @@ const App = (() => {
 
   const init = async () => {
     state.page = document.body.dataset.page || "";
-    void registerPwa();
-    navigator.serviceWorker?.ready.then(flushOfflineQueue).catch(() => undefined);
-    window.addEventListener("online", flushOfflineQueue);
+    await registerPwa();
+    await waitForPwaController();
+    navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
+    window.addEventListener("online", () => flushOfflineQueue(true));
     navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type === "OFFLINE_SYNC_ISSUE") {
+        console.warn("[SYNC] operacion pendiente de revision", event.data);
+        void (async () => {
+          await refreshCoreNow();
+          if (state.page === "admin") await refreshAdminNow();
+        })();
+        return;
+      }
       if (event.data?.type !== "OFFLINE_QUEUE_FLUSHED") return;
-      if (state.page === "admin") void refreshAdminNow();
-      if (state.page === "client" && state.currentTable) void hydrateSelectedTable(state.currentTable.id);
+      void (async () => {
+        await refreshCoreNow();
+        if (state.page === "admin") {
+          await refreshAdminNow();
+          await flushAppsScriptOutbox();
+        }
+        if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
+      })();
     });
     if (!connect()) {
       document.body.innerHTML = `

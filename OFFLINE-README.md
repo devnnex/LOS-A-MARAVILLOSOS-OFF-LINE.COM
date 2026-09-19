@@ -19,9 +19,10 @@ el nombre configurados por el negocio.
 
 Cada operación se guarda primero de forma persistente en el navegador. Con
 internet se envía de inmediato al mismo Supabase y Apps Script de la versión
-online. Tras confirmarse, se conserva solo un minuto y luego se libera ese
-espacio local. Sin internet, permanece pendiente y se reintenta
-automáticamente al regresar la conexión.
+online. La cola intenta sincronizar cada 2,5 segundos y las consultas de
+inventario/ingresos se reconcilian cada 4 segundos. Tras una confirmación
+válida, la operación se libera de la cola; sin internet permanece pendiente y
+se reintenta automáticamente sin bloquear formularios, modales ni botones.
 
 No borres los datos del navegador de Chrome ni cambies de perfil de Chrome:
 allí se conserva la cola offline.
@@ -30,3 +31,24 @@ allí se conserva la cola offline.
 
 GitHub no interviene en ventas, mesas, inventario ni propinas. Esta copia local
 usa exclusivamente Supabase y Apps Script para sincronizar los datos del POS.
+
+## Activación del backend de sincronización
+
+Antes de usar esta edición en producción se deben completar una sola vez estos
+dos pasos sobre los mismos servicios de la versión online:
+
+1. Ejecutar en Supabase la migración
+   `supabase/migrations/20260919120000_offline_sync_realtime.sql`.
+2. Publicar `appscript/Code.gs` como una nueva versión de la aplicación web.
+   El endpoint debe informar la versión `2.7.0`.
+
+La migración habilita la propagación Realtime del negocio, mesas, categorías y
+productos. La versión 2.7.0 de Apps Script añade idempotencia a ventas,
+inventario, movimientos e ingresos para que un reintento no procese dos veces
+la misma operación.
+
+## Verificación técnica
+
+Desde esta carpeta ejecuta `node tests/offline-sync.test.cjs`. Deben aprobarse
+los 15 escenarios automatizados de persistencia, orden, reintentos,
+idempotencia, conflictos y eliminaciones.

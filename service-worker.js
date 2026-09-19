@@ -1,9 +1,11 @@
-const OFFLINE_CACHE = "los-anos-offline-shell-v2";
-const REMOTE_CACHE = "los-anos-offline-remote-v2";
+const OFFLINE_CACHE = "los-anos-offline-shell-v4";
+const REMOTE_CACHE = "los-anos-offline-remote-v4";
 const OFFLINE_DB = "los-anos-offline-sync-v1";
 const OFFLINE_STORE = "entries";
 const CONFIRMED_RETENTION_MS = 2_000;
-const REMOTE_READ_TIMEOUT_MS = 1_200;
+const REMOTE_READ_TIMEOUT_MS = 2_500;
+const REMOTE_WRITE_TIMEOUT_MS = 4_000;
+const MAX_RETRY_DELAY_MS = 30_000;
 const BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
 const DYNAMIC_BRAND_ASSETS = new Set(["pwa-manifest.webmanifest", "pwa-icon-192.png", "pwa-icon-512.png"]);
 const APP_SHELL = [
@@ -14,26 +16,44 @@ const APP_SHELL = [
   "./vendor/qrcode.min.js", "./vendor/jspdf.umd.min.js"
 ];
 
-const isRemoteDataRequest = (url) =>
-  url.hostname.endsWith(".supabase.co") || url.hostname === "script.google.com";
-
-const READ_RPC_NAMES = new Set([
-  "get_bootstrap_data", "get_admin_snapshot", "get_client_snapshot",
-  "get_client_table_state", "get_initial_setup_status", "get_current_user",
-  "list_users", "list_chat_messages"
-]);
 const UUID_REST_TABLES = new Set([
-  "menu_categories", "menu_items", "restaurant_tables", "service_requests",
-  "session_items", "table_sessions"
+  "menu_categories", "menu_items", "restaurant_tables",
+  "service_requests", "session_items", "table_sessions"
 ]);
 
+// Solo estas RPC operativas poseen identificadores estables o son idempotentes.
+// Autenticacion, usuarios y RPC de lectura nunca se simulan ni se encolan.
+const QUEUEABLE_RPC_NAMES = new Set([
+  "acknowledge_service_requests", "resolve_bill", "create_service_request",
+  "create_service_requests_batch", "send_chat_message", "close_chat_session"
+]);
+const RECONCILIATION_RPC_NAMES = new Set([
+  "get_bootstrap_data", "get_admin_snapshot", "get_client_snapshot",
+  "get_client_table_state", "list_chat_messages"
+]);
+
+const isSupabaseRequest = (url) => url.hostname.endsWith(".supabase.co");
+const isRemoteDataRequest = (url) => isSupabaseRequest(url) || url.hostname === "script.google.com";
+const isRestMutation = (request, url) =>
+  isSupabaseRequest(url) && url.pathname.includes("/rest/v1/") && !url.pathname.includes("/rpc/")
+  && ["POST", "PATCH", "PUT", "DELETE"].includes(request.method);
 const rpcNameFor = (url) => url.pathname.split("/").pop() || "";
-const isReadRpcRequest = (request, url) =>
-  request.method === "POST" && url.pathname.includes("/rpc/") && READ_RPC_NAMES.has(rpcNameFor(url));
+const isQueueableRpc = (request, url) =>
+  isSupabaseRequest(url) && request.method === "POST" && url.pathname.includes("/rpc/")
+  && QUEUEABLE_RPC_NAMES.has(rpcNameFor(url));
+
+const SYNC_DEBUG = false;
+const syncLog = (event, detail = {}) => {
+  if (SYNC_DEBUG) console.debug(`[SYNC] ${event}`, detail);
+};
 
 const openOfflineDb = () => new Promise((resolve, reject) => {
   const request = indexedDB.open(OFFLINE_DB, 1);
-  request.onupgradeneeded = () => request.result.createObjectStore(OFFLINE_STORE, { keyPath: "id" });
+  request.onupgradeneeded = () => {
+    if (!request.result.objectStoreNames.contains(OFFLINE_STORE)) {
+      request.result.createObjectStore(OFFLINE_STORE, { keyPath: "id" });
+    }
+  };
   request.onsuccess = () => resolve(request.result);
   request.onerror = () => reject(request.error);
 });
@@ -50,149 +70,372 @@ const withStore = async (mode, action) => {
   });
 };
 
-const queueRequest = (entry) => withStore("readwrite", (store) => store.put(entry));
-const listQueuedRequests = () => withStore("readonly", (store) => store.getAll());
-const removeQueuedRequest = (id) => withStore("readwrite", (store) => store.delete(id));
-const markRequestConfirmed = async (entry) => queueRequest({
-  ...entry,
-  status: "confirmed",
-  confirmedAt: new Date().toISOString()
-});
+const putEntry = (entry) => withStore("readwrite", (store) => store.put(entry));
+const listEntries = () => withStore("readonly", (store) => store.getAll());
+const removeEntry = (id) => withStore("readwrite", (store) => store.delete(id));
 
-const purgeConfirmedRequests = async () => {
-  const now = Date.now();
-  const entries = await listQueuedRequests();
-  await Promise.all(entries
-    .filter((entry) => entry.status === "confirmed" && now - new Date(entry.confirmedAt || 0).getTime() >= CONFIRMED_RETENTION_MS)
-    .map((entry) => removeQueuedRequest(entry.id)));
+const entryCounts = async () => (await listEntries()).reduce((counts, entry) => {
+  const status = entry.status || "pending";
+  counts[status] = Number(counts[status] || 0) + 1;
+  return counts;
+}, { pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
+
+const hasBlockingEntries = async () => (await listEntries())
+  .some((entry) => ["pending", "syncing"].includes(entry.status));
+
+const extractRecordId = (url, payload) => {
+  const raw = url.searchParams.get("id") || "";
+  if (raw.startsWith("eq.")) return raw.slice(3);
+  if (!Array.isArray(payload) && payload?.id) return String(payload.id);
+  return "";
 };
 
-const scheduleConfirmedCleanup = () => {
-  setTimeout(() => { void purgeConfirmedRequests(); }, CONFIRMED_RETENTION_MS);
+const extractRecordIds = (url, payload) => {
+  const single = extractRecordId(url, payload);
+  if (single) return [single];
+  if (!Array.isArray(payload)) return [];
+  return payload.map((row) => String(row?.id || "")).filter(Boolean);
+};
+
+const normalizeRestPayload = (request, url, rawBody) => {
+  let payload = {};
+  try { payload = rawBody ? JSON.parse(rawBody) : {}; } catch (_) { return { body: rawBody, payload: {} }; }
+  const table = url.pathname.split("/").pop();
+  if (request.method === "POST" && UUID_REST_TABLES.has(table)) {
+    const withId = (row) => row && typeof row === "object" && !row.id
+      ? { ...row, id: crypto.randomUUID() }
+      : row;
+    payload = Array.isArray(payload) ? payload.map(withId) : withId(payload);
+  }
+  return { body: JSON.stringify(payload), payload };
 };
 
 const serializeRequest = async (request) => {
-  let body = ["GET", "HEAD"].includes(request.method) ? "" : await request.clone().text();
   const url = new URL(request.url);
-  const table = url.pathname.split("/").pop();
-  // El id se genera antes de responder a la pantalla: la fila local y la fila
-  // que llegara a Supabase conservan exactamente la misma identidad.
-  if (request.method === "POST" && url.pathname.includes("/rest/v1/") && UUID_REST_TABLES.has(table)) {
-    try {
-      const payload = JSON.parse(body || "{}");
-      const withId = (row) => row && typeof row === "object" && !row.id ? { ...row, id: crypto.randomUUID() } : row;
-      body = JSON.stringify(Array.isArray(payload) ? payload.map(withId) : withId(payload));
-    } catch (_) { /* La solicitud original se conserva si no es JSON. */ }
-  }
+  const rawBody = ["GET", "HEAD"].includes(request.method) ? "" : await request.clone().text();
+  const normalized = isRestMutation(request, url)
+    ? normalizeRestPayload(request, url, rawBody)
+    : (() => {
+        try { return { body: rawBody, payload: rawBody ? JSON.parse(rawBody) : {} }; }
+        catch (_) { return { body: rawBody, payload: {} }; }
+      })();
+  const entity = url.pathname.includes("/rpc/") ? `rpc:${rpcNameFor(url)}` : url.pathname.split("/").pop();
+  const recordIds = extractRecordIds(url, normalized.payload);
   return {
     id: crypto.randomUUID(),
+    operationId: crypto.randomUUID(),
+    source: "supabase",
+    entity,
+    recordId: recordIds[0] || "",
+    recordIds,
+    operationType: request.method,
     url: request.url,
     method: request.method,
     headers: [...request.headers.entries()],
-    body,
-    queuedAt: new Date().toISOString()
+    body: normalized.body,
+    payload: normalized.payload,
+    createdAt: new Date().toISOString(),
+    createdOrder: performance.timeOrigin + performance.now(),
+    attempts: 0,
+    status: "pending",
+    nextAttemptAt: 0,
+    lastError: ""
   };
 };
 
-const wantsObject = (request) => String(request.headers.get("accept") || "").includes("application/vnd.pgrst.object+json");
-
-const queuedWriteResponse = (entry) => {
-  const text = entry.body;
+const normalizeStoredEntry = (entry) => {
+  if (entry.operationId && entry.entity && entry.createdAt) return entry;
+  const url = new URL(entry.url);
   let payload = {};
-  try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = {}; }
-  const timestamp = new Date().toISOString();
-  const makeRow = (row) => ({
+  try { payload = entry.body ? JSON.parse(entry.body) : {}; } catch (_) { payload = {}; }
+  const entity = url.pathname.includes("/rpc/") ? `rpc:${rpcNameFor(url)}` : url.pathname.split("/").pop();
+  return {
+    ...entry,
+    operationId: entry.operationId || entry.id || crypto.randomUUID(),
+    entity,
+    payload,
+    recordId: entry.recordId || extractRecordId(url, payload),
+    recordIds: entry.recordIds || extractRecordIds(url, payload),
+    operationType: entry.operationType || entry.method,
+    createdAt: entry.createdAt || entry.queuedAt || new Date().toISOString(),
+    createdOrder: Number(entry.createdOrder || new Date(entry.createdAt || entry.queuedAt || 0).getTime()),
+    attempts: Number(entry.attempts || 0),
+    nextAttemptAt: Number(entry.nextAttemptAt || 0),
+    lastError: entry.lastError || ""
+  };
+};
+
+const wantsObject = (headers) => String(new Headers(headers).get("accept") || "")
+  .includes("application/vnd.pgrst.object+json");
+
+const localRow = (entry, row = {}) => {
+  const now = new Date().toISOString();
+  return {
     ...(row && typeof row === "object" ? row : {}),
-    id: row?.id || crypto.randomUUID(),
-    created_at: row?.created_at || timestamp,
-    updated_at: timestamp
-  });
-  const body = entry.method === "DELETE"
-    ? []
-    : new URL(entry.url).hostname === "script.google.com" || entry.url.includes("/rpc/")
-      ? { ok: true, offline_queued: true }
-    : Array.isArray(payload)
-      ? payload.map(makeRow)
-        : wantsObject({ headers: new Headers(entry.headers) })
-          ? makeRow(payload)
-          : [makeRow(payload)];
+    ...(entry.recordId ? { id: entry.recordId } : {}),
+    id: row?.id || entry.recordId || crypto.randomUUID(),
+    created_at: row?.created_at || now,
+    updated_at: now,
+    _offline_pending: true
+  };
+};
+
+const queuedRpcPayload = (entry) => {
+  const payload = entry.payload || {};
+  const rpcName = String(entry.entity || "").replace(/^rpc:/, "");
+  if (rpcName === "create_service_requests_batch") {
+    return {
+      results: (payload.requests || []).map((request) => ({
+        request: localRow(entry, {
+          id: request.request_id,
+          table_id: request.table_id,
+          session_id: request.session_id,
+          request_type: request.request_type,
+          message: request.message || "",
+          status: "pending"
+        }),
+        duplicate: false
+      }))
+    };
+  }
+  if (rpcName === "create_service_request") {
+    return {
+      request: localRow(entry, {
+        id: payload.request_id,
+        table_id: payload.table_id,
+        session_id: payload.session_id,
+        request_type: payload.request_type,
+        message: payload.message || "",
+        status: "pending"
+      }),
+      duplicate: false
+    };
+  }
+  if (rpcName === "send_chat_message") {
+    return { message: localRow(entry, {
+      id: payload.p_message_id,
+      session_id: payload.p_session_id,
+      table_id: payload.p_table_id,
+      sender_type: payload.p_sender_type,
+      body: payload.p_body
+    }) };
+  }
+  if (rpcName === "acknowledge_service_requests") {
+    return (payload.ids || []).map((id) => localRow(entry, {
+      id,
+      status: payload.message ? "resolved" : "acknowledged",
+      acknowledged_at: payload.acknowledged_at,
+      message: payload.message || ""
+    }));
+  }
+  if (rpcName === "resolve_bill") return localRow(entry, { id: payload.request_id, status: "resolved" });
+  if (rpcName === "close_chat_session") return { closed: true, session_id: payload.p_session_id };
+  return { ok: true, offline_queued: true, operation_id: entry.operationId };
+};
+
+const queuedResponse = (entry) => {
+  if (String(entry.entity).startsWith("rpc:")) {
+    return new Response(JSON.stringify(queuedRpcPayload(entry)), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "X-Offline-Queued": "1" }
+    });
+  }
+  const payload = entry.payload || {};
+  let body;
+  if (entry.method === "DELETE") {
+    const deleted = localRow(entry, { id: entry.recordId });
+    body = wantsObject(entry.headers) ? deleted : [deleted];
+  } else if (Array.isArray(payload)) {
+    body = payload.map((row) => localRow(entry, row));
+  } else {
+    const row = localRow(entry, payload);
+    body = wantsObject(entry.headers) ? row : [row];
+  }
   return new Response(JSON.stringify(body), {
-    status: entry.method === "DELETE" ? 200 : 201,
+    status: entry.method === "POST" ? 201 : 200,
     headers: { "Content-Type": "application/json", "X-Offline-Queued": "1" }
   });
 };
 
-let flushingQueue = null;
-
-const notifyQueueFlushed = async () => {
-  const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-  windows.forEach((client) => client.postMessage({ type: "OFFLINE_QUEUE_FLUSHED" }));
+const purgeConfirmedEntries = async () => {
+  const now = Date.now();
+  const entries = await listEntries();
+  await Promise.all(entries
+    .filter((entry) => entry.status === "confirmed"
+      && now - new Date(entry.confirmedAt || 0).getTime() >= CONFIRMED_RETENTION_MS)
+    .map((entry) => removeEntry(entry.id)));
 };
 
-const flushQueue = () => {
+const scheduleConfirmedCleanup = () => {
+  setTimeout(() => { void purgeConfirmedEntries(); }, CONFIRMED_RETENTION_MS);
+};
+
+const recoverInterruptedEntries = async () => {
+  const entries = await listEntries();
+  await Promise.all(entries
+    .filter((entry) => entry.status === "syncing")
+    .map((entry) => putEntry({ ...entry, status: "pending", nextAttemptAt: 0 })));
+};
+
+const notifyClients = async (type, payload = {}) => {
+  const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  windows.forEach((client) => client.postMessage({ type, ...payload }));
+};
+
+const retryDelay = (attempts) => Math.min(MAX_RETRY_DELAY_MS, 500 * Math.pow(2, Math.min(attempts, 6)));
+const isTransientStatus = (status) => [408, 425, 429, 500, 502, 503, 504].includes(status);
+const comparable = (value) => value === null || typeof value !== "object" ? String(value ?? "") : JSON.stringify(value);
+
+const desiredRowMatches = (row, payload) => {
+  if (!row || !payload || Array.isArray(payload)) return Boolean(row);
+  return Object.entries(payload)
+    .filter(([key]) => !["created_at", "updated_at", "_offline_pending"].includes(key))
+    .every(([key, value]) => comparable(row[key]) === comparable(value));
+};
+
+const verifyRestMutation = async (entry) => {
+  const recordIds = entry.recordIds?.length ? entry.recordIds : (entry.recordId ? [entry.recordId] : []);
+  if (!recordIds.length || String(entry.entity).startsWith("rpc:")) return false;
+  const url = new URL(entry.url);
+  url.search = "";
+  url.searchParams.set("id", recordIds.length === 1 ? `eq.${recordIds[0]}` : `in.(${recordIds.join(",")})`);
+  url.searchParams.set("select", "*");
+  const headers = new Headers(entry.headers);
+  ["content-type", "content-length", "prefer", "accept-profile"].forEach((name) => headers.delete(name));
+  headers.set("Accept", "application/json");
+  try {
+    const response = await fetch(url.href, { method: "GET", headers });
+    if (!response.ok) return false;
+    const rows = await response.json();
+    const received = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+    if (entry.method === "DELETE") return received.length === 0;
+    const desired = Array.isArray(entry.payload) ? entry.payload : [entry.payload];
+    return desired.length === recordIds.length && desired.every((payload, index) => {
+      const expectedId = String(payload?.id || recordIds[index] || "");
+      const row = received.find((candidate) => String(candidate?.id || "") === expectedId);
+      return desiredRowMatches(row, payload);
+    });
+  } catch (_) {
+    return false;
+  }
+};
+
+let flushingQueue = null;
+
+const flushQueue = (force = false) => {
   if (flushingQueue) return flushingQueue;
   flushingQueue = (async () => {
-    let flushed = false;
-    await purgeConfirmedRequests();
+    let confirmedAny = false;
+    await recoverInterruptedEntries();
+    await purgeConfirmedEntries();
     while (true) {
-      const entry = (await listQueuedRequests())
-        .filter((candidate) => candidate.status !== "confirmed")
-        .sort((left, right) => String(left.queuedAt).localeCompare(String(right.queuedAt)))[0];
+      const now = Date.now();
+      const found = (await listEntries())
+        .filter((candidate) => candidate.status === "pending" && (force || Number(candidate.nextAttemptAt || 0) <= now))
+        .sort((left, right) => Number(left.createdOrder || new Date(left.createdAt || left.queuedAt || 0).getTime())
+          - Number(right.createdOrder || new Date(right.createdAt || right.queuedAt || 0).getTime()))[0];
+      const entry = found ? normalizeStoredEntry(found) : null;
       if (!entry) break;
+      await putEntry({ ...entry, status: "syncing", lastAttemptAt: new Date().toISOString() });
+      syncLog("sending", { operationId: entry.operationId, entity: entry.entity, method: entry.method });
       try {
-        const response = await fetch(entry.url, {
+        const queuedRequest = new Request(entry.url, {
           method: entry.method,
           headers: entry.headers,
           body: ["GET", "HEAD"].includes(entry.method) ? undefined : entry.body
         });
-        if (!response.ok) break;
-        await markRequestConfirmed(entry);
-        scheduleConfirmedCleanup();
-        flushed = true;
-      } catch (_) {
+        const response = await fetchWithTimeout(queuedRequest, REMOTE_WRITE_TIMEOUT_MS);
+        let confirmed = response.ok;
+        // PostgREST puede responder 200 a un PATCH/DELETE cuyo filtro no
+        // encontro filas. Para operaciones con identidad estable comprobamos
+        // el estado final antes de liberar la cola.
+        if (confirmed && entry.recordIds?.length && ["PATCH", "PUT", "DELETE"].includes(entry.method)) {
+          confirmed = await verifyRestMutation(entry);
+        }
+        if (!confirmed && [406, 409].includes(response.status)) confirmed = await verifyRestMutation(entry);
+        if (confirmed) {
+          await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "" });
+          scheduleConfirmedCleanup();
+          confirmedAny = true;
+          syncLog("success", { operationId: entry.operationId, entity: entry.entity });
+          continue;
+        }
+        const message = `${response.status} ${response.statusText}`.trim();
+        if (isTransientStatus(response.status)) {
+          const attempts = Number(entry.attempts || 0) + 1;
+          await putEntry({ ...entry, status: "pending", attempts, lastError: message, nextAttemptAt: Date.now() + retryDelay(attempts) });
+          syncLog("retry", { operationId: entry.operationId, attempts, error: message });
+        } else {
+          const status = [406, 409].includes(response.status) ? "conflict" : "failed";
+          await putEntry({ ...entry, status, attempts: Number(entry.attempts || 0) + 1, lastError: message });
+          syncLog(status, { operationId: entry.operationId, error: message });
+          await notifyClients("OFFLINE_SYNC_ISSUE", { status, operationId: entry.operationId, entity: entry.entity });
+        }
+        break;
+      } catch (error) {
+        const attempts = Number(entry.attempts || 0) + 1;
+        await putEntry({
+          ...entry,
+          status: "pending",
+          attempts,
+          lastError: String(error?.message || error || "network_error"),
+          nextAttemptAt: Date.now() + retryDelay(attempts)
+        });
+        syncLog("retry", { operationId: entry.operationId, attempts, error: String(error?.message || error) });
         break;
       }
     }
-    await purgeConfirmedRequests();
-    if (flushed) await notifyQueueFlushed();
+    await purgeConfirmedEntries();
+    if (confirmedAny) await notifyClients("OFFLINE_QUEUE_FLUSHED", { counts: await entryCounts() });
+    return entryCounts();
   })().finally(() => { flushingQueue = null; });
   return flushingQueue;
 };
 
-const saveThenSend = async (request) => {
-  const entry = { ...await serializeRequest(request), status: "pending" };
-  await queueRequest(entry);
+const saveLocallyThenSend = async (request) => {
+  const entry = await serializeRequest(request);
+  await putEntry(entry);
+  syncLog("queued", { operationId: entry.operationId, entity: entry.entity, method: entry.method });
   if (self.registration.sync) {
-    try { await self.registration.sync.register("los-anos-sync"); } catch (_) { /* El evento online reintenta. */ }
+    try { await self.registration.sync.register("los-anos-sync"); } catch (_) { /* El pulso de la app tambien reintenta. */ }
   }
   void flushQueue();
-  return queuedWriteResponse(entry);
+  return queuedResponse(entry);
+};
+
+const fetchWithTimeout = async (request, timeoutMs = REMOTE_READ_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(new Request(request, { signal: controller.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const networkFirst = async (request) => {
   const cache = await caches.open(REMOTE_CACHE);
+  const remote = isRemoteDataRequest(new URL(request.url));
   try {
-    if (isRemoteDataRequest(new URL(request.url)) && !self.navigator.onLine) throw new Error("offline");
-    const response = await fetch(request);
-    if (response.ok) await cache.put(request, response.clone());
+    if (remote && await hasBlockingEntries()) throw new Error("pending_local_writes");
+    const response = remote ? await fetchWithTimeout(request) : await fetch(request);
+    if (response.ok && request.method === "GET") await cache.put(request, response.clone());
     return response;
   } catch (error) {
-    const cached = await cache.match(request);
+    const cached = request.method === "GET" ? await cache.match(request) : null;
     if (cached) return cached;
     throw error;
   }
 };
 
-const readRpc = async (request) => {
-  if (!self.navigator.onLine) return new Response('{"message":"offline"}', { status: 503, headers: { "Content-Type": "application/json" } });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REMOTE_READ_TIMEOUT_MS);
+const directSupabaseRequest = async (request, url) => {
+  if (RECONCILIATION_RPC_NAMES.has(rpcNameFor(url)) && await hasBlockingEntries()) {
+    return new Response('{"message":"pending_local_writes"}', { status: 503, headers: { "Content-Type": "application/json" } });
+  }
   try {
-    return await fetch(new Request(request, { signal: controller.signal }));
+    return await fetchWithTimeout(request);
   } catch (_) {
     return new Response('{"message":"offline"}', { status: 503, headers: { "Content-Type": "application/json" } });
-  } finally {
-    clearTimeout(timer);
   }
 };
 
@@ -237,14 +480,14 @@ self.addEventListener("fetch", (event) => {
     if (isRemoteDataRequest(url)) event.respondWith(networkFirst(request));
     return;
   }
-  if (isRemoteDataRequest(url) && isReadRpcRequest(request, url)) {
-    event.respondWith(readRpc(request));
-    return;
-  }
-  if (isRemoteDataRequest(url) && ["POST", "PATCH", "PUT", "DELETE"].includes(request.method)) {
-    const response = saveThenSend(request);
+  if (isRestMutation(request, url) || isQueueableRpc(request, url)) {
+    const response = saveLocallyThenSend(request);
     event.respondWith(response);
     event.waitUntil(response.then(() => flushQueue()));
+    return;
+  }
+  if (isSupabaseRequest(url) && request.method === "POST" && url.pathname.includes("/rpc/")) {
+    event.respondWith(directSupabaseRequest(request, url));
   }
 });
 
@@ -253,5 +496,10 @@ self.addEventListener("sync", (event) => {
 });
 
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "FLUSH_OFFLINE_QUEUE") event.waitUntil(flushQueue());
+  if (event.data?.type === "FLUSH_OFFLINE_QUEUE") {
+    event.waitUntil(flushQueue(event.data?.force === true).then((counts) => event.ports?.[0]?.postMessage({ ok: true, counts })));
+  }
+  if (event.data?.type === "GET_OFFLINE_SYNC_STATUS") {
+    event.waitUntil(entryCounts().then((counts) => event.ports?.[0]?.postMessage({ ok: true, counts })));
+  }
 });

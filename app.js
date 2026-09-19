@@ -5789,6 +5789,32 @@ const App = (() => {
         ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
+        <script>
+          (() => {
+            let printStarted = false;
+            const printWhenReady = async () => {
+              if (printStarted) return;
+              printStarted = true;
+              try {
+                if (document.fonts?.ready) await document.fonts.ready;
+                const images = Array.from(document.images || []);
+                await Promise.all(images.map((image) => {
+                  if (image.complete) return image.decode?.().catch(() => undefined);
+                  return new Promise((resolve) => {
+                    image.addEventListener("load", resolve, { once: true });
+                    image.addEventListener("error", resolve, { once: true });
+                  });
+                }));
+                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              } finally {
+                window.focus();
+                window.print();
+              }
+            };
+            if (document.readyState === "complete") void printWhenReady();
+            else window.addEventListener("load", () => { void printWhenReady(); }, { once: true });
+          })();
+        <\/script>
       </body></html>`;
   };
 
@@ -5798,32 +5824,6 @@ const App = (() => {
       toast("El navegador bloqueo la ventana de impresion. Habilita ventanas emergentes e intenta de nuevo.", "error", "receipt-popup-blocked");
       return false;
     }
-    let printStarted = false;
-    const printWhenReady = async () => {
-      if (printStarted || popup.closed) return;
-      printStarted = true;
-      const receiptDocument = popup.document;
-      try {
-        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
-        const images = Array.from(receiptDocument.images || []);
-        await Promise.all(images.map((image) => {
-          if (image.complete) return image.decode?.().catch(() => undefined);
-          return new Promise((resolve) => {
-            image.addEventListener("load", resolve, { once: true });
-            image.addEventListener("error", resolve, { once: true });
-          });
-        }));
-        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
-      } catch (_) {
-        // La impresión continúa aun si una fuente o imagen opcional no puede cargarse.
-      }
-      if (!popup.closed) {
-        popup.focus();
-        popup.print();
-      }
-    };
-    const onReceiptLoad = () => { void printWhenReady(); };
-    popup.addEventListener("load", onReceiptLoad, { once: true });
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();

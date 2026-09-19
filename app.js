@@ -1,4 +1,4 @@
-const SYNC_INTERVAL_MS = 5000;
+const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
 
 const SUPABASE_CONFIG = {
@@ -7672,7 +7672,7 @@ const App = (() => {
       .subscribe((status) => {
         if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setRealtimeStatus("Respaldo cada 5 segundos", "fallback");
+          setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
         }
       });
     state.subscriptions.push(channel);

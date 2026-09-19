@@ -5789,32 +5789,6 @@ const App = (() => {
         ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
-        <script>
-          (() => {
-            let printStarted = false;
-            const printWhenReady = async () => {
-              if (printStarted) return;
-              printStarted = true;
-              try {
-                if (document.fonts?.ready) await document.fonts.ready;
-                const images = Array.from(document.images || []);
-                await Promise.all(images.map((image) => {
-                  if (image.complete) return image.decode?.().catch(() => undefined);
-                  return new Promise((resolve) => {
-                    image.addEventListener("load", resolve, { once: true });
-                    image.addEventListener("error", resolve, { once: true });
-                  });
-                }));
-                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-              } finally {
-                window.focus();
-                window.print();
-              }
-            };
-            if (document.readyState === "complete") void printWhenReady();
-            else window.addEventListener("load", () => { void printWhenReady(); }, { once: true });
-          })();
-        <\/script>
       </body></html>`;
   };
 
@@ -5827,6 +5801,41 @@ const App = (() => {
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();
+    const receiptDocument = popup.document;
+    const waitForReceiptLoad = () => {
+      if (receiptDocument.readyState === "complete") return Promise.resolve();
+      return new Promise((resolve) => {
+        const complete = () => {
+          if (receiptDocument.readyState !== "complete") return;
+          popup.removeEventListener("load", complete);
+          receiptDocument.removeEventListener("readystatechange", complete);
+          resolve();
+        };
+        popup.addEventListener("load", complete, { once: true });
+        receiptDocument.addEventListener("readystatechange", complete);
+      });
+    };
+    const printWhenReady = async () => {
+      await waitForReceiptLoad();
+      try {
+        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
+        const images = Array.from(receiptDocument.images || []);
+        await Promise.all(images.map((image) => {
+          if (image.complete) return image.decode?.().catch(() => undefined);
+          return new Promise((resolve) => {
+            image.addEventListener("load", resolve, { once: true });
+            image.addEventListener("error", resolve, { once: true });
+          });
+        }));
+        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
+      } finally {
+        if (!popup.closed) {
+          popup.focus();
+          popup.print();
+        }
+      }
+    };
+    void printWhenReady();
     return true;
   };
 

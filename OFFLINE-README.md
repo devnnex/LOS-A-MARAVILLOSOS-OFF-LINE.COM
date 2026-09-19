@@ -10,6 +10,11 @@ http://127.0.0.1:8765/admin.html en una ventana independiente de Chrome.
 Después de la primera apertura con internet, sus archivos esenciales quedan
 disponibles localmente.
 
+Para dejar el acceso en el escritorio y anclarlo a la barra de tareas con el
+icono del negocio, abre el menú de Chrome en esa ventana y elige Instalar
+Los Años Maravillosos. Chrome crea la aplicación instalada usando el icono y
+el nombre configurados por el negocio.
+
 ## Sincronización de datos
 
 La aplicación conserva el último estado consultado y, si una escritura hacia

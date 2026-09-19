@@ -89,6 +89,7 @@ const App = (() => {
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
   const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
   const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
+  const TIP_RESET_STORAGE_KEY = "tienda_napoles_tip_reset_invoices_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
   const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
@@ -285,6 +286,7 @@ const App = (() => {
     activePaymentTip: 0,
     tipSettings: { enabled: false, percentage: 10 },
     tipSplitPeople: 1,
+    clearedTipInvoiceKeys: new Set(),
     paymentProcessing: false,
     lastPaidReceipt: null,
     appsScriptOutboxBusy: false,
@@ -1608,6 +1610,8 @@ const App = (() => {
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
     state.tipSplitPeople = Math.min(100, Math.max(1, Number(localStorage.getItem(TIP_SPLIT_STORAGE_KEY) || 1)));
+    const clearedTips = readLocalJson(TIP_RESET_STORAGE_KEY, []);
+    state.clearedTipInvoiceKeys = new Set(Array.isArray(clearedTips) ? clearedTips.map(String) : []);
     if (state.page === "admin") loadWalkInDrafts();
   };
 
@@ -1662,6 +1666,16 @@ const App = (() => {
       localStorage.setItem(TIP_SETTINGS_STORAGE_KEY, JSON.stringify(state.tipSettings));
     } catch (error) {
       toast("No se pudo guardar la configuración de propina en este equipo.", "error", "tip-settings-storage-failed");
+    }
+  };
+
+  const tipInvoiceKey = (invoice) => String(invoice?.id || invoice?.sessionId || invoice?.number || "");
+
+  const persistClearedTipInvoices = () => {
+    try {
+      localStorage.setItem(TIP_RESET_STORAGE_KEY, JSON.stringify([...state.clearedTipInvoiceKeys]));
+    } catch (error) {
+      toast("No se pudo reiniciar las propinas en este equipo.", "error", "tip-reset-storage-failed");
     }
   };
 
@@ -5248,9 +5262,11 @@ const App = (() => {
     const recordsBox = $("#tipsRecords");
     const peopleInput = $("#tipSplitPeople");
     const splitResult = $("#tipSplitResult");
+    const resetButton = $("#resetTips");
     if (!kpis || !recordsBox || !peopleInput || !splitResult) return;
+    if (resetButton) resetButton.hidden = state.currentUser?.role !== "admin";
     const tipInvoices = state.invoiceHistory
-      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0 && !state.clearedTipInvoiceKeys.has(tipInvoiceKey(invoice)))
       .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
     const todayKey = localDateKey();
     const todayInvoices = tipInvoices.filter((invoice) => localDateKey(invoice.createdAt) === todayKey);
@@ -5277,6 +5293,16 @@ const App = (() => {
         }).join("")
       : emptyState("Aún no hay propinas facturadas", "Cuando cobres una cuenta con propina aparecerá aquí con todos sus detalles.", "hand-coins");
     refreshIcons();
+  };
+
+  const resetTips = () => {
+    if (state.currentUser?.role !== "admin") return;
+    state.invoiceHistory
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
+      .forEach((invoice) => state.clearedTipInvoiceKeys.add(tipInvoiceKey(invoice)));
+    persistClearedTipInvoices();
+    renderTips();
+    toast("La sección de propinas quedó en $0.", "ok", "tips-reset");
   };
 
   const renderAdmin = () => {
@@ -7130,6 +7156,7 @@ const App = (() => {
       localStorage.setItem(TIP_SPLIT_STORAGE_KEY, String(people));
       renderTips();
     });
+    $("#resetTips")?.addEventListener("click", resetTips);
     $("#tableForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveTable(event.currentTarget);

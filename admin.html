@@ -12,7 +12,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260919-manual-tip-price-edit-1">
+    <link rel="stylesheet" href="style.css?v=20260919-tips-reset-warning-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -413,7 +413,10 @@
             <h2>Propinas</h2>
             <p>Consulta lo acumulado hoy y calcula cuánto corresponde por persona.</p>
           </div>
-          <span class="tips-live-badge"><i data-lucide="sparkles"></i> Propina activa</span>
+          <div class="tips-section-actions">
+            <span class="tips-live-badge"><i data-lucide="sparkles"></i> Propina activa</span>
+            <button class="ghost small tips-reset-button" id="resetTips" type="button" hidden><i data-lucide="trash-2"></i> Reiniciar</button>
+          </div>
         </div>
         <div class="tips-kpis" id="tipsKpis"></div>
         <div class="tips-layout">
@@ -552,7 +555,7 @@
           <div class="consumption-selection-head"><strong>Selección actual</strong><span id="consumptionSelectionCount">0 productos</span></div>
           <div class="consumption-selection-lines" id="consumptionSelectionLines"></div>
           <div class="consumption-selection-total"><span>Total de la selección</span><strong id="consumptionSelectionTotal">$0</strong></div>
-          <div class="consumption-selection-price-warning" id="consumptionSelectionPriceWarning" hidden><i data-lucide="triangle-alert"></i><span>El precio fue editado.</span></div>
+          <div class="consumption-selection-price-warning" id="consumptionSelectionPriceWarning" hidden><i data-lucide="triangle-alert"></i><span>Precio ha sido editado: posible consumo para las mesas de afuera. Cuidado.</span></div>
         </div>
         <div class="modal-actions">
           <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
@@ -761,6 +764,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260919-manual-tip-price-edit-1"></script>
+    <script src="app.js?v=20260919-tips-reset-warning-1"></script>
   </body>
 </html>

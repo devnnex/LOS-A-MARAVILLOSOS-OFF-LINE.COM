@@ -1,7 +1,7 @@
 # Los Años Maravillosos Offline
 
-Esta carpeta es una edición local separada. La versión publicada y su rama
-main no se modifican desde aquí.
+Esta carpeta es una edición local separada. La versión publicada no se
+modifica desde aquí.
 
 ## Uso diario
 
@@ -17,20 +17,16 @@ el nombre configurados por el negocio.
 
 ## Sincronización de datos
 
-La aplicación conserva el último estado consultado y, si una escritura hacia
-Supabase o Apps Script no puede salir por red, la encola de forma persistente
-en el navegador. Cuando retorna la conexión, la cola se reintenta
-automáticamente.
+Cada operación se guarda primero de forma persistente en el navegador. Con
+internet se envía de inmediato al mismo Supabase y Apps Script de la versión
+online. Tras confirmarse, se conserva solo un minuto y luego se libera ese
+espacio local. Sin internet, permanece pendiente y se reintenta
+automáticamente al regresar la conexión.
 
 No borres los datos del navegador de Chrome ni cambies de perfil de Chrome:
 allí se conserva la cola offline.
 
-## Actualizaciones del código
+## Código y datos
 
-El remoto de GitHub se conserva solo para leer actualizaciones y el push está
-bloqueado en esta copia. Al iniciar, el actualizador consulta main antes de
-abrir el POS. Si no hay red, hay cambios locales o existe un conflicto,
-conserva la última copia funcional y no arriesga la operación.
-
-Las actualizaciones del código deben integrarse y probarse antes de usarlas;
-GitHub no es una base de datos para ventas.
+GitHub no interviene en ventas, mesas, inventario ni propinas. Esta copia local
+usa exclusivamente Supabase y Apps Script para sincronizar los datos del POS.

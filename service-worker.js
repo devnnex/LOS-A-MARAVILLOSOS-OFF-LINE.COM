@@ -2,6 +2,7 @@ const OFFLINE_CACHE = "los-anos-offline-shell-v1";
 const REMOTE_CACHE = "los-anos-offline-remote-v1";
 const OFFLINE_DB = "los-anos-offline-sync-v1";
 const OFFLINE_STORE = "entries";
+const CONFIRMED_RETENTION_MS = 60_000;
 const BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
 const DYNAMIC_BRAND_ASSETS = new Set(["pwa-manifest.webmanifest", "pwa-icon-192.png", "pwa-icon-512.png"]);
 const APP_SHELL = [
@@ -37,6 +38,23 @@ const withStore = async (mode, action) => {
 const queueRequest = (entry) => withStore("readwrite", (store) => store.put(entry));
 const listQueuedRequests = () => withStore("readonly", (store) => store.getAll());
 const removeQueuedRequest = (id) => withStore("readwrite", (store) => store.delete(id));
+const markRequestConfirmed = async (entry) => queueRequest({
+  ...entry,
+  status: "confirmed",
+  confirmedAt: new Date().toISOString()
+});
+
+const purgeConfirmedRequests = async () => {
+  const now = Date.now();
+  const entries = await listQueuedRequests();
+  await Promise.all(entries
+    .filter((entry) => entry.status === "confirmed" && now - new Date(entry.confirmedAt || 0).getTime() >= CONFIRMED_RETENTION_MS)
+    .map((entry) => removeQueuedRequest(entry.id)));
+};
+
+const scheduleConfirmedCleanup = () => {
+  setTimeout(() => { void purgeConfirmedRequests(); }, CONFIRMED_RETENTION_MS);
+};
 
 const serializeRequest = async (request) => ({
   id: crypto.randomUUID(),
@@ -75,16 +93,11 @@ const queuedWriteResponse = async (request) => {
   });
 };
 
-const queueRemoteWrite = async (request) => {
-  await queueRequest(await serializeRequest(request));
-  if (self.registration.sync) {
-    try { await self.registration.sync.register("los-anos-sync"); } catch (_) { /* El evento online reintenta. */ }
-  }
-  return queuedWriteResponse(request);
-};
-
 const flushQueue = async () => {
-  const entries = (await listQueuedRequests()).sort((left, right) => String(left.queuedAt).localeCompare(String(right.queuedAt)));
+  await purgeConfirmedRequests();
+  const entries = (await listQueuedRequests())
+    .filter((entry) => entry.status !== "confirmed")
+    .sort((left, right) => String(left.queuedAt).localeCompare(String(right.queuedAt)));
   for (const entry of entries) {
     try {
       const response = await fetch(entry.url, {
@@ -93,10 +106,32 @@ const flushQueue = async () => {
         body: ["GET", "HEAD"].includes(entry.method) ? undefined : entry.body
       });
       if (!response.ok) break;
-      await removeQueuedRequest(entry.id);
+      await markRequestConfirmed(entry);
+      scheduleConfirmedCleanup();
     } catch (_) {
       break;
     }
+  }
+  await purgeConfirmedRequests();
+};
+
+const saveThenSend = async (request) => {
+  const entry = { ...await serializeRequest(request), status: "pending" };
+  await queueRequest(entry);
+  try {
+    const response = await fetch(request.clone());
+    if (response.ok) {
+      await markRequestConfirmed(entry);
+      scheduleConfirmedCleanup();
+    } else {
+      await removeQueuedRequest(entry.id);
+    }
+    return response;
+  } catch (_) {
+    if (self.registration.sync) {
+      try { await self.registration.sync.register("los-anos-sync"); } catch (_) { /* El evento online reintenta. */ }
+    }
+    return queuedWriteResponse(request);
   }
 };
 
@@ -155,7 +190,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   if (isRemoteDataRequest(url) && ["POST", "PATCH", "PUT", "DELETE"].includes(request.method)) {
-    event.respondWith(fetch(request.clone()).catch(() => queueRemoteWrite(request)));
+    event.respondWith(saveThenSend(request));
   }
 });
 

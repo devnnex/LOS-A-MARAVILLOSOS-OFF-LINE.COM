@@ -1,7 +1,6 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-python offline-updater.py
 start "Los Anios Offline Server" /b python offline-server.py
 timeout /t 1 /nobreak >nul
 if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" (

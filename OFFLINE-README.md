@@ -28,8 +28,9 @@ allí se conserva la cola offline.
 ## Actualizaciones del código
 
 El remoto de GitHub se conserva solo para leer actualizaciones y el push está
-bloqueado en esta copia. Antes de actualizar, cierra la aplicación y revisa
-los cambios con git fetch origin main.
+bloqueado en esta copia. Al iniciar, el actualizador consulta main antes de
+abrir el POS. Si no hay red, hay cambios locales o existe un conflicto,
+conserva la última copia funcional y no arriesga la operación.
 
 Las actualizaciones del código deben integrarse y probarse antes de usarlas;
 GitHub no es una base de datos para ventas.

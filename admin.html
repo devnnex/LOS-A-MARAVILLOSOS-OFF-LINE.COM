@@ -12,7 +12,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260918-tip-payment-1">
+    <link rel="stylesheet" href="style.css?v=20260919-manual-tip-price-edit-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -552,6 +552,7 @@
           <div class="consumption-selection-head"><strong>Selección actual</strong><span id="consumptionSelectionCount">0 productos</span></div>
           <div class="consumption-selection-lines" id="consumptionSelectionLines"></div>
           <div class="consumption-selection-total"><span>Total de la selección</span><strong id="consumptionSelectionTotal">$0</strong></div>
+          <div class="consumption-selection-price-warning" id="consumptionSelectionPriceWarning" hidden><i data-lucide="triangle-alert"></i><span>El precio fue editado.</span></div>
         </div>
         <div class="modal-actions">
           <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
@@ -604,8 +605,9 @@
 
         <fieldset class="payment-tip-choice" id="paymentTipChoice" hidden>
           <legend>¿Cómo desea pagar el cliente?</legend>
-          <label><input type="radio" name="tip_choice" value="without"><span><i data-lucide="receipt"></i><strong>Sin propina</strong><small id="paymentWithoutTipAmount">Total consumo</small></span></label>
-          <label><input type="radio" name="tip_choice" value="with"><span><i data-lucide="hand-coins"></i><strong id="paymentWithTipLabel">Con propina</strong><small id="paymentWithTipAmount">Propina voluntaria</small></span></label>
+          <label class="payment-tip-option"><input type="radio" name="tip_choice" value="without"><span><i data-lucide="receipt"></i><strong>Sin propina</strong><small id="paymentWithoutTipAmount">Total consumo</small></span></label>
+          <label class="payment-tip-option"><input type="radio" name="tip_choice" value="with"><span><i data-lucide="hand-coins"></i><strong id="paymentWithTipLabel">Con propina</strong><small id="paymentWithTipAmount">Propina voluntaria</small></span></label>
+          <label class="payment-tip-manual"><span><i data-lucide="banknote"></i> Propina en pesos (opcional)</span><input name="tip_amount" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input><small>Escribe el valor que deja el cliente para reemplazar la sugerencia.</small></label>
         </fieldset>
 
         <div class="payment-sale-lines" id="paymentSaleLines"></div>
@@ -759,6 +761,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260918-tip-payment-1"></script>
+    <script src="app.js?v=20260919-manual-tip-price-edit-1"></script>
   </body>
 </html>

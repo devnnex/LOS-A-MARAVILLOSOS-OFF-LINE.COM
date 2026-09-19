@@ -5782,7 +5782,7 @@ const App = (() => {
           ${totals.discount ? `<span>Descuento</span><strong>-${money(totals.discount)}</strong>` : ""}
           ${totals.tax ? `<span>Impuestos</span><strong>${money(totals.tax)}</strong>` : ""}
           ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
-          ${chargedTip ? `<span>Propina voluntaria (${Number(invoice.tipPercentage || 0)}%)</span><strong>${money(chargedTip)}</strong>` : ""}
+          ${chargedTip ? `<span>Propina voluntaria${invoice.tipPercentage ? ` (${Number(invoice.tipPercentage)}%)` : ""}</span><strong>${money(chargedTip)}</strong>` : ""}
           ${suggestedTip ? `<span>Propina voluntaria sugerida (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong>` : ""}
           <span class="total">${suggestedTip ? "TOTAL SUGERIDO" : "TOTAL"}</span><strong class="total">${money(receiptTotal)}</strong>
         </div>
@@ -5883,7 +5883,9 @@ const App = (() => {
     const baseTotal = integerMoney(state.activePaymentBase);
     const enabled = tipsEnabled();
     const choice = form.tip_choice?.value || "";
-    const tip = enabled && choice === "with" ? tipAmountFor(baseTotal) : 0;
+    const manualTip = enabled && choice === "with" ? currencyInputNumber(form.tip_amount) : 0;
+    const suggestedTip = tipAmountFor(baseTotal);
+    const tip = enabled && choice === "with" ? (manualTip || suggestedTip) : 0;
     const total = baseTotal + tip;
     state.activePaymentTip = tip;
     state.activePaymentTotal = total;
@@ -5891,11 +5893,11 @@ const App = (() => {
     if ($("#paymentTotalHint")) $("#paymentTotalHint").textContent = enabled && !choice
       ? "Selecciona si el cliente paga con o sin propina para continuar."
       : tip
-        ? `Incluye ${money(tip)} de propina voluntaria.`
+        ? `Incluye ${money(tip)} de propina voluntaria${manualTip ? " ingresada manualmente" : ""}.`
         : "Total del consumo sin propina.";
     if ($("#paymentWithoutTipAmount")) $("#paymentWithoutTipAmount").textContent = money(baseTotal);
-    if ($("#paymentWithTipLabel")) $("#paymentWithTipLabel").textContent = `Con propina (${state.tipSettings.percentage}%)`;
-    if ($("#paymentWithTipAmount")) $("#paymentWithTipAmount").textContent = `${money(tipAmountFor(baseTotal))} · Total ${money(baseTotal + tipAmountFor(baseTotal))}`;
+    if ($("#paymentWithTipLabel")) $("#paymentWithTipLabel").textContent = manualTip ? "Con propina manual" : `Con propina (${state.tipSettings.percentage}%)`;
+    if ($("#paymentWithTipAmount")) $("#paymentWithTipAmount").textContent = `${money(manualTip || suggestedTip)} · Total ${money(baseTotal + (manualTip || suggestedTip))}`;
     setCurrencyInputValue(form.cash_received, total);
     setCurrencyInputValue(form.mixed_amount_one, total);
     setCurrencyInputValue(form.mixed_amount_two, 0);
@@ -6095,8 +6097,9 @@ const App = (() => {
       return;
     }
     const createdAt = closed.saved.closed_at || new Date().toISOString();
-    const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" ? Number(state.tipSettings.percentage) : 0;
-    const tipAmount = tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0;
+    const manualTip = tipsEnabled() && form.tip_choice.value === "with" ? currencyInputNumber(form.tip_amount) : 0;
+    const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" && !manualTip ? Number(state.tipSettings.percentage) : 0;
+    const tipAmount = manualTip || (tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0);
     const invoiceTotals = {
       ...closed.totals,
       baseTotal: integerMoney(closed.totals.total),
@@ -6119,6 +6122,7 @@ const App = (() => {
       withTip: tipAmount > 0,
       tipPercentage,
       tipAmount,
+      tipIsManual: manualTip > 0,
       baseTotal: integerMoney(closed.totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
@@ -6150,15 +6154,61 @@ const App = (() => {
     const lines = $("#consumptionSelectionLines");
     const count = $("#consumptionSelectionCount");
     const total = $("#consumptionSelectionTotal");
+    const priceWarning = $("#consumptionSelectionPriceWarning");
     if (!box || !lines || !count || !total) return;
     const drafts = state.consumptionDrafts;
+    const canEditPrice = state.currentUser?.role !== "waiter";
+    const hasEditedPrice = drafts.some((draft) => draft.menuItemId && Number(draft.unitPrice) !== Number(draft.originalUnitPrice));
     box.hidden = drafts.length === 0;
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
-    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    if (priceWarning) priceWarning.hidden = !hasEditedPrice;
+    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
     const form = $("#consumptionForm");
     if (form) form.quantity.required = drafts.length === 0;
     refreshIcons();
+  };
+
+  const editConsumptionDraftPrice = (priceElement) => {
+    if (state.currentUser?.role === "waiter") return;
+    const index = Number(priceElement?.dataset.editConsumptionDraft);
+    const draft = state.consumptionDrafts[index];
+    if (!Number.isInteger(index) || !draft) return;
+    const input = document.createElement("input");
+    input.className = "consumption-draft-price-editor";
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", `Precio unitario de ${draft.itemName}`);
+    input.value = formattedCurrencyInput(draft.unitPrice);
+    let saved = false;
+    const save = () => {
+      if (saved) return;
+      saved = true;
+      draft.unitPrice = currencyInputNumber(input);
+      renderConsumptionSelection();
+    };
+    input.addEventListener("input", () => {
+      input.value = formattedCurrencyInput(input.value, { allowEmpty: true });
+      input.setSelectionRange?.(input.value.length, input.value.length);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        save();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        saved = true;
+        renderConsumptionSelection();
+      }
+    });
+    input.addEventListener("blur", save, { once: true });
+    priceElement.replaceWith(input);
+    window.requestAnimationFrame(() => {
+      input.focus({ preventScroll: true });
+      input.select();
+    });
   };
 
   const currentConsumptionDraft = (form, { quiet = false } = {}) => {
@@ -6175,6 +6225,7 @@ const App = (() => {
       itemName,
       quantity,
       unitPrice,
+      originalUnitPrice: selectedItem ? Number(selectedItem.price || 0) : null,
       notes: form.notes.value.trim(),
       payerName: form.payer_name.value.trim()
     };
@@ -7168,6 +7219,10 @@ const App = (() => {
       else queueConsumptionDraft();
     });
     $("#consumptionQueueButton")?.addEventListener("click", queueConsumptionDraft);
+    $("#consumptionSelectionLines")?.addEventListener("dblclick", (event) => {
+      const price = event.target.closest("[data-edit-consumption-draft]");
+      if (price) editConsumptionDraftPrice(price);
+    });
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
@@ -7184,6 +7239,10 @@ const App = (() => {
       if (event.target.name === "mixed_method_one" || event.target.name === "mixed_method_two") syncMixedMethods(event.target.name);
     });
     $("#paymentForm")?.addEventListener("input", (event) => {
+      if (event.target.name === "tip_amount") {
+        event.currentTarget.tip_choice.value = "with";
+        updatePaymentTipChoice();
+      }
       if (event.target.name === "mixed_amount_one" || event.target.name === "mixed_amount_two") updateMixedPayment(event.target.name);
       if (event.target.name === "cash_received") updateCashChange();
     });

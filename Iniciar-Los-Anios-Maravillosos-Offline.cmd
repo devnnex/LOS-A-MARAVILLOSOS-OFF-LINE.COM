@@ -2,6 +2,10 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
+if exist "%~dp0crear-acceso-directo.ps1" (
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0crear-acceso-directo.ps1" >nul 2>&1
+)
+
 set "APP_URL=http://127.0.0.1:8765/admin.html"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $response=Invoke-WebRequest -UseBasicParsing -Uri '%APP_URL%' -TimeoutSec 2; if ($response.StatusCode -ne 200) { exit 1 }" >nul 2>&1

@@ -5738,11 +5738,12 @@ const App = (() => {
     const issuedAt = new Date(invoice?.createdAt || Date.now());
     const payments = invoice?.payments || [];
     return `<!doctype html>
-      <html lang="es"><head><meta charset="utf-8"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
+      <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
-        @page { size: 80mm auto; margin: 3mm; }
+        @page { size: 58mm auto; margin: 0; }
         * { box-sizing: border-box; }
-        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
+        html, body { display: block; visibility: visible; width: 58mm; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
+        body { margin: 0 auto; font: 12px/1.35 "Courier New", monospace; }
         .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
@@ -5755,6 +5756,9 @@ const App = (() => {
         .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
         .footer { margin-top: 3mm; text-align: center; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
+        @media print {
+          html, body { display: block !important; visibility: visible !important; width: 58mm !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+        }
       </style></head><body>
         <div class="logo">${escapeHTML(businessName)}</div>
         <div class="subtitle">FACTURA DE VENTA</div>
@@ -5785,7 +5789,6 @@ const App = (() => {
         ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
-        <script>window.onload=function(){setTimeout(function(){window.print()},250)}<\/script>
       </body></html>`;
   };
 
@@ -5795,6 +5798,32 @@ const App = (() => {
       toast("El navegador bloqueo la ventana de impresion. Habilita ventanas emergentes e intenta de nuevo.", "error", "receipt-popup-blocked");
       return false;
     }
+    let printStarted = false;
+    const printWhenReady = async () => {
+      if (printStarted || popup.closed) return;
+      printStarted = true;
+      const receiptDocument = popup.document;
+      try {
+        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
+        const images = Array.from(receiptDocument.images || []);
+        await Promise.all(images.map((image) => {
+          if (image.complete) return image.decode?.().catch(() => undefined);
+          return new Promise((resolve) => {
+            image.addEventListener("load", resolve, { once: true });
+            image.addEventListener("error", resolve, { once: true });
+          });
+        }));
+        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
+      } catch (_) {
+        // La impresión continúa aun si una fuente o imagen opcional no puede cargarse.
+      }
+      if (!popup.closed) {
+        popup.focus();
+        popup.print();
+      }
+    };
+    const onReceiptLoad = () => { void printWhenReady(); };
+    popup.addEventListener("load", onReceiptLoad, { once: true });
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();

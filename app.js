@@ -5740,10 +5740,10 @@ const App = (() => {
     return `<!doctype html>
       <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
-        @page { size: 58mm auto; margin: 0; }
+        @page { size: 80mm auto; margin: 3mm; }
         * { box-sizing: border-box; }
-        html, body { display: block; visibility: visible; width: 58mm; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
-        body { margin: 0 auto; font: 12px/1.35 "Courier New", monospace; }
+        html { display: block; visibility: visible; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
+        body { display: block; visibility: visible; width: 72mm; min-height: 0; margin: 0 auto; padding: 0; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
         .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
@@ -5757,7 +5757,8 @@ const App = (() => {
         .footer { margin-top: 3mm; text-align: center; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
         @media print {
-          html, body { display: block !important; visibility: visible !important; width: 58mm !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+          html { display: block !important; visibility: visible !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+          body { display: block !important; visibility: visible !important; width: 72mm !important; min-height: 0 !important; margin: 0 auto !important; padding: 0 !important; overflow: visible !important; }
         }
       </style></head><body>
         <div class="logo">${escapeHTML(businessName)}</div>

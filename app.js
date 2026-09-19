@@ -6425,6 +6425,7 @@ const App = (() => {
     form.session_id.value = optimisticSessionId;
     form.pending_table_id.value = "";
     state.accountsRenderSignature = "";
+    persistOfflineAdminSnapshot();
     renderAdminLive();
     toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
 
@@ -6484,6 +6485,7 @@ const App = (() => {
       form.session_id.value = "";
       form.pending_table_id.value = table.id;
       state.accountsRenderSignature = "";
+      persistOfflineAdminSnapshot();
       renderAdminLive();
       toast("No fue posible abrir la cuenta de la mesa. La selección fue restaurada.", "error", `batch-session-failed:${optimisticSessionId}`);
       return null;
@@ -6549,10 +6551,12 @@ const App = (() => {
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
       } : null
     });
+    persistOfflineAdminSnapshot();
     return { sessionId: persistedSessionId, items: savedItems };
   };
 
   const confirmConsumptionSelection = async (form) => {
+    if (form.dataset.localSubmitInProgress === "1") return null;
     if (form.session_item_id.value) return addManualConsumption(form);
     const hasPendingEntry = Boolean(form.menu_item_id.value || form.item_name.value.trim() || form.quantity.value || $("#consumptionProductSearch")?.value.trim());
     const pendingEntry = currentConsumptionDraft(form, { quiet: true });
@@ -6567,28 +6571,29 @@ const App = (() => {
     }
     const drafts = [...state.consumptionDrafts];
     const quickCheckout = form.quick_checkout.value === "1";
-    const submit = $("#consumptionSubmitButton");
-    const queue = $("#consumptionQueueButton");
-    if (submit) submit.disabled = true;
-    if (queue) queue.disabled = true;
-    $("#consumptionDialog")?.close();
-    const result = await addConsumptionBatch(form, drafts);
-    if (submit) submit.disabled = false;
-    if (queue) queue.disabled = false;
-    if (!result) {
-      state.consumptionDrafts = drafts;
-      clearConsumptionEntry(form);
+    form.dataset.localSubmitInProgress = "1";
+    try {
+      const result = await addConsumptionBatch(form, drafts);
+      if (!result) {
+        state.consumptionDrafts = drafts;
+        clearConsumptionEntry(form);
+        renderConsumptionSelection();
+        return null;
+      }
+      state.consumptionDrafts = [];
       renderConsumptionSelection();
-      $("#consumptionDialog")?.showModal();
-      return null;
+      const sessionId = result.sessionId;
+      clearConsumptionEntry(form);
+      if (quickCheckout) {
+        $("#consumptionDialog")?.close();
+        openPaymentDialog(sessionId);
+      } else {
+        $("#consumptionProductSearch")?.focus({ preventScroll: true });
+      }
+      return sessionId;
+    } finally {
+      delete form.dataset.localSubmitInProgress;
     }
-    state.consumptionDrafts = [];
-    renderConsumptionSelection();
-    const sessionId = result.sessionId;
-    $("#consumptionDialog")?.close();
-    clearConsumptionEntry(form);
-    if (quickCheckout) openPaymentDialog(sessionId);
-    return sessionId;
   };
 
   const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
@@ -6814,6 +6819,7 @@ const App = (() => {
         assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
       }
     });
+    persistOfflineAdminSnapshot();
     if (!keepOpen) $("#consumptionDialog")?.close();
     renderAdminLive();
     if (isLocalWalkInSession(session)) {
@@ -6844,6 +6850,7 @@ const App = (() => {
     if (!saved) {
       state.optimisticSessionStates.delete(sessionId);
       state.sessions = state.sessions.map((entry) => entry.id === sessionId ? session : entry);
+      persistOfflineAdminSnapshot();
       renderAdmin();
       toast("No se pudo guardar el consumo. La cuenta fue restaurada y el inventario no cambio.", "error", `consumption-failed:${temporaryId}`);
       return null;
@@ -6868,6 +6875,7 @@ const App = (() => {
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
       } : null
     });
+    persistOfflineAdminSnapshot();
     if (!silent) toast(itemId ? "Consumo actualizado." : "Producto agregado a la cuenta.", "ok", `consumption-saved:${saved.id}`);
     if (openPaymentAfter) openPaymentDialog(sessionId);
     return { sessionId, item: saved };
@@ -8418,6 +8426,11 @@ const App = (() => {
     void registerPwa();
     navigator.serviceWorker?.ready.then(flushOfflineQueue).catch(() => undefined);
     window.addEventListener("online", flushOfflineQueue);
+    navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type !== "OFFLINE_QUEUE_FLUSHED") return;
+      if (state.page === "admin") void refreshAdminNow();
+      if (state.page === "client" && state.currentTable) void hydrateSelectedTable(state.currentTable.id);
+    });
     if (!connect()) {
       document.body.innerHTML = `
         <main class="setup-screen">

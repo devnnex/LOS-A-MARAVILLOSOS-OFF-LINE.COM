@@ -2,6 +2,7 @@ const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
 const OFFLINE_SYNC_PULSE_MS = 2500;
 const REMOTE_STORAGE_POLL_MS = 4000;
+const REMOTE_CONFIRMATION_HOLD_MS = 15000;
 
 const SUPABASE_CONFIG = {
   url: "https://zwguroyjngzrdbdwvzkg.supabase.co",
@@ -1022,8 +1023,28 @@ const App = (() => {
     }
   };
 
-  const flushOfflineQueue = (force = false) => {
-    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force });
+  const flushOfflineQueue = (force = false, timeoutMs = 30000) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) {
+      resolve({ ok: false, counts: { pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 } });
+      return;
+    }
+    const channel = new MessageChannel();
+    let finished = false;
+    const finish = (result) => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timer);
+      channel.port1.close();
+      resolve(result || { ok: false, counts: { pending: 1 } });
+    };
+    const timer = window.setTimeout(() => finish({ ok: false, counts: { pending: 1 } }), timeoutMs);
+    channel.port1.onmessage = (event) => finish(event.data || { ok: false, counts: { pending: 1 } });
+    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force }, [channel.port2]);
+  });
+
+  const reportNetworkStatus = (online = navigator.onLine) => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "SET_NETWORK_STATUS", online: Boolean(online) });
   };
 
   const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
@@ -1040,6 +1061,7 @@ const App = (() => {
       if (finished) return;
       finished = true;
       window.clearTimeout(timer);
+      channel.port1.close();
       resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, ...counts });
     };
     const timer = window.setTimeout(() => finish({ pending: 1 }), timeoutMs);
@@ -1050,7 +1072,7 @@ const App = (() => {
   const hasPendingSupabaseWrites = async () => {
     if (state.localSupabaseWrites > 0) return true;
     const counts = await getOfflineSyncStatus();
-    return Number(counts.pending || 0) + Number(counts.syncing || 0) > 0;
+    return ["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
   };
 
   const startOfflineSyncPulse = () => {
@@ -2187,6 +2209,34 @@ const App = (() => {
     }
   };
 
+  const flushPendingOfflineWrites = async () => {
+    const result = await flushOfflineQueue(true);
+    const counts = result?.counts || await getOfflineSyncStatus();
+    return !navigator.onLine || !["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
+  };
+
+  const refreshOperationalDataNow = async () => {
+    const flushed = await flushPendingOfflineWrites();
+    if (!flushed) return false;
+    await refreshAdminNow();
+    return true;
+  };
+
+  let reconnectSyncPromise = null;
+  const synchronizeAfterReconnect = () => {
+    if (reconnectSyncPromise) return reconnectSyncPromise;
+    reconnectSyncPromise = (async () => {
+      const result = await flushOfflineQueue(true);
+      const counts = result?.counts || await getOfflineSyncStatus();
+      if (["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0)) return false;
+      await refreshCoreNow();
+      if (state.page === "admin") await refreshAdminNow();
+      if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
+      return true;
+    })().finally(() => { reconnectSyncPromise = null; });
+    return reconnectSyncPromise;
+  };
+
   const startRemoteStoragePolling = () => {
     window.clearInterval(state.remoteStoragePollTimer);
     state.remoteStoragePollTimer = window.setInterval(() => { void refreshRemoteStorageNow(); }, REMOTE_STORAGE_POLL_MS);
@@ -3252,6 +3302,7 @@ const App = (() => {
   const mergeOptimisticSessions = (serverSessions = []) => {
     const merged = new Map(serverSessions.map((session) => [session.id, session]));
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
+      const now = Date.now();
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
         merged.delete(sessionId);
@@ -3269,13 +3320,62 @@ const App = (() => {
         String(serverSession?.assigned_waiter_id || "") === String(overlay.expectedSession.assigned_waiter_id || "")
       );
       if (serverSession && expectedItemConfirmed && expectedSessionConfirmed) {
-        state.optimisticSessionStates.delete(sessionId);
+        const confirmedAt = Number(overlay.confirmedAt || now);
+        if (now - confirmedAt >= REMOTE_CONFIRMATION_HOLD_MS) {
+          state.optimisticSessionStates.delete(sessionId);
+        } else {
+          state.optimisticSessionStates.set(sessionId, { ...overlay, session: serverSession, confirmedAt });
+        }
         merged.set(sessionId, serverSession);
       } else {
         merged.set(sessionId, overlay.session);
       }
     });
     return Array.from(merged.values());
+  };
+
+  const applyOfflineSessionRemap = ({ previousId, sessionId, tableId } = {}) => {
+    const fromId = String(previousId || "");
+    const toId = String(sessionId || "");
+    if (!fromId || !toId || fromId === toId) return false;
+    const overlay = state.optimisticSessionStates.get(fromId);
+    const localSession = overlay?.session || state.sessions.find((entry) => String(entry.id) === fromId);
+    const remoteSession = state.sessions.find((entry) => String(entry.id) === toId);
+    if (!localSession && !overlay) return false;
+    const expectedItems = (overlay?.expectedItems || (overlay?.expectedItem ? [overlay.expectedItem] : []))
+      .map((item) => ({ ...item, session_id: toId }));
+    const itemMap = new Map((remoteSession?.session_items || []).map((item) => [String(item.id), item]));
+    expectedItems.forEach((item) => itemMap.set(String(item.id), item));
+    const expectedSession = overlay?.expectedSession || {};
+    const mergedSession = {
+      ...(localSession || {}),
+      ...(remoteSession || {}),
+      id: toId,
+      table_id: remoteSession?.table_id || localSession?.table_id || tableId || null,
+      payer_name: Object.prototype.hasOwnProperty.call(expectedSession, "payer_name")
+        ? expectedSession.payer_name : (remoteSession?.payer_name || localSession?.payer_name || ""),
+      assigned_waiter_id: Object.prototype.hasOwnProperty.call(expectedSession, "assigned_waiter_id")
+        ? expectedSession.assigned_waiter_id : (remoteSession?.assigned_waiter_id || localSession?.assigned_waiter_id || null),
+      restaurant_tables: remoteSession?.restaurant_tables || localSession?.restaurant_tables || null,
+      session_items: Array.from(itemMap.values())
+    };
+    state.sessions = [mergedSession, ...state.sessions.filter((entry) => ![fromId, toId].includes(String(entry.id)))];
+    state.optimisticSessionStates.delete(fromId);
+    if (overlay) {
+      state.optimisticSessionStates.set(toId, {
+        ...overlay,
+        session: mergedSession,
+        ...(overlay.expectedItem ? { expectedItem: { ...overlay.expectedItem, session_id: toId } } : {}),
+        ...(overlay.expectedItems ? { expectedItems } : {})
+      });
+    }
+    if (String(state.currentSession?.id || "") === fromId) state.currentSession = mergedSession;
+    const consumptionForm = $("#consumptionForm");
+    if (consumptionForm && String(consumptionForm.session_id?.value || "") === fromId) consumptionForm.session_id.value = toId;
+    state.adminSnapshotSignature = "";
+    persistOfflineAdminSnapshot();
+    if (state.page === "admin") renderAdminLive();
+    return true;
   };
 
   const isSongRequest = (request) => request.request_type === "other"
@@ -8120,6 +8220,7 @@ const App = (() => {
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
         await runRefreshAction(target, async () => {
+          if (!await refreshOperationalDataNow()) return false;
           const flushed = await flushAppsScriptOutbox();
           if (!flushed || readAppsScriptOutbox().length) return false;
           const coreRefreshed = await refreshCoreNow();
@@ -8130,7 +8231,10 @@ const App = (() => {
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => (await loadIncomeReport()) || !navigator.onLine, "Ingresos actualizados.");
+      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => {
+        if (!await refreshOperationalDataNow()) return false;
+        return (await loadIncomeReport()) || !navigator.onLine;
+      }, "Ingresos actualizados.");
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
@@ -8138,6 +8242,7 @@ const App = (() => {
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await runRefreshAction(target, async () => {
+        if (!await refreshOperationalDataNow()) return false;
         if (!navigator.onLine) {
           renderInventoryMovements();
           return true;
@@ -9021,9 +9126,18 @@ const App = (() => {
     state.page = document.body.dataset.page || "";
     await registerPwa();
     await waitForPwaController();
+    reportNetworkStatus();
     navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
-    window.addEventListener("online", () => flushOfflineQueue(true));
+    window.addEventListener("online", () => {
+      reportNetworkStatus(true);
+      void synchronizeAfterReconnect();
+    });
+    window.addEventListener("offline", () => reportNetworkStatus(false));
     navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type === "OFFLINE_SESSION_REMAPPED") {
+        applyOfflineSessionRemap(event.data);
+        return;
+      }
       if (event.data?.type === "OFFLINE_SYNC_ISSUE") {
         console.warn("[SYNC] operacion pendiente de revision", event.data);
         void (async () => {

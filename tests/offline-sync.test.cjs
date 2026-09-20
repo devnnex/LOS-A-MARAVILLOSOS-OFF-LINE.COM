@@ -231,6 +231,8 @@ test("11 bloquea reconciliación remota mientras hay cambios locales", async () 
 test("12 no encola RPC de lectura ni autenticación", async () => {
   const rpc = new Request("https://example.supabase.co/rest/v1/rpc/get_current_user", { method: "POST", body: "{}" });
   assert.equal(api.isQueueableRpc(rpc, new URL(rpc.url)), false);
+  const tableZones = new Request("https://example.supabase.co/rest/v1/rpc/save_table_zones", { method: "POST", body: JSON.stringify({ outdoor_table_ids: [] }) });
+  assert.equal(api.isQueueableRpc(tableZones, new URL(tableZones.url)), true);
 });
 
 test("13 adapta la respuesta local de RPC idempotente", async () => {

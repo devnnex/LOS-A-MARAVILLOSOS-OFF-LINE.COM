@@ -1,5 +1,5 @@
-const OFFLINE_CACHE = "los-anos-offline-shell-v4";
-const REMOTE_CACHE = "los-anos-offline-remote-v4";
+const OFFLINE_CACHE = "los-anos-offline-shell-v5";
+const REMOTE_CACHE = "los-anos-offline-remote-v5";
 const OFFLINE_DB = "los-anos-offline-sync-v1";
 const OFFLINE_STORE = "entries";
 const CONFIRMED_RETENTION_MS = 2_000;
@@ -25,7 +25,8 @@ const UUID_REST_TABLES = new Set([
 // Autenticacion, usuarios y RPC de lectura nunca se simulan ni se encolan.
 const QUEUEABLE_RPC_NAMES = new Set([
   "acknowledge_service_requests", "resolve_bill", "create_service_request",
-  "create_service_requests_batch", "send_chat_message", "close_chat_session"
+  "create_service_requests_batch", "send_chat_message", "close_chat_session",
+  "save_table_zones"
 ]);
 const RECONCILIATION_RPC_NAMES = new Set([
   "get_bootstrap_data", "get_admin_snapshot", "get_client_snapshot",

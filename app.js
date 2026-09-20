@@ -277,6 +277,7 @@ const App = (() => {
     invoiceHistory: [],
     inventorySearch: "",
     inventoryStatusFilter: "all",
+    inventoryCategoryFilter: "all",
     incomeReport: null,
     incomeLoading: false,
     incomeRequestId: 0,
@@ -325,6 +326,11 @@ const App = (() => {
     offlineSyncTimer: null,
     remoteStoragePollTimer: null,
     activeAdminSection: "dashboard",
+    dashboardTableZoneFilter: "all",
+    serviceTableZoneFilter: "all",
+    outdoorTableDraftIds: null,
+    outdoorTableDraftDirty: false,
+    sectionRenderTimer: null,
     pwaBrandSignature: "",
     pwaBrandSyncToken: 0,
     pwaManifestObjectUrl: "",
@@ -501,31 +507,36 @@ const App = (() => {
       state.sb.from("business_settings").select("*").eq("is_primary", true).maybeSingle(),
       null
     );
-    state.business = data || {
+    state.business = data || state.business || {
       business_name: "Tu restaurante",
       subtitle: "Servicio a la mesa rapido y claro",
       accent_color: "#f05a28",
-      currency: DEFAULT_CURRENCY
+      currency: DEFAULT_CURRENCY,
+      tips_enabled: false,
+      tip_percentage: 10
     };
+    applyBusinessTipSettings();
     document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
+    return Boolean(data);
   };
 
   const loadCore = async () => {
     const [tables, categories, items] = await Promise.all([
-      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), []),
-      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), []),
+      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), null),
+      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), null),
       db(
         state.sb
           .from("menu_items")
           .select("*, menu_categories(name)")
           .order("sort_order", { ascending: true }),
-        []
+        null
       )
     ]);
-    state.tables = tables || [];
-    state.categories = categories || [];
-    state.items = items || [];
+    if (Array.isArray(tables)) state.tables = tables;
+    if (Array.isArray(categories)) state.categories = categories;
+    if (Array.isArray(items)) state.items = items;
     loadInventoryStore();
+    return Array.isArray(tables) && Array.isArray(categories) && Array.isArray(items);
   };
 
   const ensurePresetCategories = async () => {
@@ -564,6 +575,11 @@ const App = (() => {
   const isServicePoint = (table) => Boolean(servicePointKind(table));
 
   const normalTables = () => state.tables.filter((table) => !isServicePoint(table));
+
+  const isOutdoorTable = (table) => table?.is_outdoor === true;
+
+  const tableMatchesZone = (table, filter = "all") => filter === "all"
+    || (filter === "outdoor" ? isOutdoorTable(table) : !isOutdoorTable(table));
 
   const sessionLabel = (session) => session?.sale_channel === "walk_in" || !session?.table_id
     ? "Venta individual"
@@ -658,7 +674,15 @@ const App = (() => {
       const target = link.getAttribute("href")?.replace("#", "");
       link.classList.toggle("active", target === section);
     });
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+    if (section === "movements" && navigator.onLine && isAppsScriptConfigured()) {
+      const list = $("#inventoryMovementList");
+      const summary = $("#movementSummary");
+      if (list) list.innerHTML = emptyState("Actualizando movimientos", "Consultando el historial oficial...", "refresh-cw");
+      if (summary) summary.innerHTML = "";
+      refreshIcons();
+    }
+    clearTimeout(state.sectionRenderTimer);
+    state.sectionRenderTimer = window.setTimeout(() => {
       if (state.activeAdminSection !== section) return;
       if (section === "dashboard") {
         renderAlerts();
@@ -673,7 +697,7 @@ const App = (() => {
       }
       if (section === "inventory") renderInventory();
       if (section === "movements") {
-        renderInventoryMovements();
+        if (!navigator.onLine || !isAppsScriptConfigured()) renderInventoryMovements();
         void loadInventoryMovements();
       }
       if (section === "income") {
@@ -684,7 +708,7 @@ const App = (() => {
       if (section === "users") renderUsers();
       if (section === "assistant") renderAdminAi();
       refreshIcons();
-    }));
+    }, 60);
   };
 
   const findTableFromUrl = () => {
@@ -1661,6 +1685,17 @@ const App = (() => {
     }
   };
 
+  function applyBusinessTipSettings() {
+    if (!state.business || !Object.prototype.hasOwnProperty.call(state.business, "tips_enabled")) return false;
+    const percentage = Math.min(100, Math.max(1, Number(state.business.tip_percentage || 10)));
+    state.tipSettings = {
+      enabled: state.business.tips_enabled === true,
+      percentage: Number.isFinite(percentage) ? percentage : 10
+    };
+    try { localStorage.setItem(TIP_SETTINGS_STORAGE_KEY, JSON.stringify(state.tipSettings)); } catch (error) { /* Respaldo local opcional. */ }
+    return true;
+  }
+
   const productAcronym = (name = "") => normalizeText(name)
     .split(" ")
     .filter(Boolean)
@@ -1678,6 +1713,7 @@ const App = (() => {
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
+    applyBusinessTipSettings();
     state.tipSplitPeople = Math.min(100, Math.max(1, Number(localStorage.getItem(TIP_SPLIT_STORAGE_KEY) || 1)));
     const clearedTips = readLocalJson(TIP_RESET_STORAGE_KEY, []);
     state.clearedTipInvoiceKeys = new Set(Array.isArray(clearedTips) ? clearedTips.map(String) : []);
@@ -1934,8 +1970,14 @@ const App = (() => {
     };
   };
 
-  const applyRemoteInventoryItems = (items = []) => {
+  const applyRemoteInventoryItems = (items = [], { replace = false } = {}) => {
     if (!Array.isArray(items)) return;
+    if (replace) {
+      const remoteIds = new Set(items.map((item) => String(item?.productId || "")).filter(Boolean));
+      Object.keys(state.inventoryMeta).forEach((productId) => {
+        if (!remoteIds.has(String(productId))) delete state.inventoryMeta[productId];
+      });
+    }
     items.forEach((remote) => {
       const item = state.items.find((entry) => entry.id === remote.productId);
       if (!item) return;
@@ -2088,14 +2130,8 @@ const App = (() => {
     try {
       const result = await appsScriptRequest("get_inventory");
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
-      if (Array.isArray(result.items) && result.items.length) {
-        applyRemoteInventoryItems(result.items);
-      } else {
-        const localItems = state.items
-          .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
-          .map(inventoryPayload);
-        if (localItems.length) enqueueAppsScriptJob("sync_inventory", { items: localItems }, "inventory:initial-sync");
-      }
+      if (!Array.isArray(result.items)) throw new Error("El inventario remoto devolvió una respuesta inválida.");
+      applyRemoteInventoryItems(result.items, { replace: true });
       setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
       return true;
     } catch (error) {
@@ -3547,14 +3583,25 @@ const App = (() => {
     if (state.coreSyncBusy || await hasPendingSupabaseWrites()) return false;
     state.coreSyncBusy = true;
     try {
-      await Promise.all([loadBusiness(), loadCore()]);
+      const [businessLoaded, coreLoaded] = await Promise.all([loadBusiness(), loadCore()]);
+      applyBusinessTipSettings();
+      if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
       persistBootstrapCache();
-      if (state.page === "admin") renderAdmin();
+      if (state.page === "admin") {
+        renderBrand();
+        syncTipFeatureVisibility();
+        renderTables();
+        renderServiceTables();
+        renderTableManager();
+        renderMenuManager();
+        renderInventory();
+        if (state.activeAdminSection === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
+      }
       else {
         renderBrand();
         renderMenu();
       }
-      return true;
+      return businessLoaded || coreLoaded;
     } finally {
       state.coreSyncBusy = false;
     }
@@ -3638,7 +3685,8 @@ const App = (() => {
         table.table_number,
         table.table_name,
         table.qr_code,
-        table.is_active
+        table.is_active,
+        table.is_outdoor
       ]),
       sessions: state.sessions.map((session) => [
         session.id,
@@ -3647,7 +3695,8 @@ const App = (() => {
         sessionTotal(session),
         (session.session_items || []).length
       ]),
-      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status])
+      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status]),
+      filters: [state.dashboardTableZoneFilter, state.serviceTableZoneFilter]
     });
 
   const groupedActiveRequests = () => {
@@ -3722,13 +3771,14 @@ const App = (() => {
     refreshIcons();
   };
 
-  const compactTableTiles = () => normalTables()
+  const compactTableTiles = (zoneFilter = "all") => normalTables()
     .filter((table) => table.is_active !== false)
+    .filter((table) => tableMatchesZone(table, zoneFilter))
     .map((table) => {
       const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
       const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
       const occupied = Boolean(session);
-      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
+      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${isOutdoorTable(table) ? "outdoor" : "indoor"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
     }).join("");
 
   const renderTables = () => {
@@ -3736,14 +3786,20 @@ const App = (() => {
     if (!box) return;
     state.tableRenderSignature = tablesSignature();
     box.classList.add("compact-tables-grid");
-    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea las mesas del negocio para comenzar.", "layout-grid");
+    const filter = state.dashboardTableZoneFilter;
+    const select = $("#dashboardTableZoneFilter");
+    if (select) select.value = filter;
+    box.innerHTML = compactTableTiles(filter) || emptyState("Sin mesas", filter === "all" ? "Crea las mesas del negocio para comenzar." : "No hay mesas en esta ubicación.", "layout-grid");
     refreshIcons();
   };
 
   const renderServiceTables = () => {
     const box = $("#waiterTablesGrid");
     if (!box) return;
-    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea una mesa activa para atenderla.", "armchair");
+    const filter = state.serviceTableZoneFilter;
+    const select = $("#serviceTableZoneFilter");
+    if (select) select.value = filter;
+    box.innerHTML = compactTableTiles(filter) || emptyState("Sin mesas", filter === "all" ? "Crea una mesa activa para atenderla." : "No hay mesas en esta ubicación.", "armchair");
     renderServicePoints();
     refreshIcons();
   };
@@ -3814,6 +3870,68 @@ const App = (() => {
     })();
   };
 
+  const renderOutdoorTableConfigurator = () => {
+    const selector = $("#outdoorTableSelector");
+    const from = $("#outdoorTableFrom");
+    const to = $("#outdoorTableTo");
+    if (!selector || !from || !to) return;
+    const tables = normalTables()
+      .filter((table) => table.is_active !== false)
+      .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+    const validIds = new Set(tables.map((table) => String(table.id)));
+    if (!(state.outdoorTableDraftIds instanceof Set)) {
+      state.outdoorTableDraftIds = new Set(tables.filter(isOutdoorTable).map((table) => String(table.id)));
+    } else {
+      state.outdoorTableDraftIds = new Set([...state.outdoorTableDraftIds].filter((id) => validIds.has(String(id))));
+    }
+    const options = tables.map((table) => `<option value="${escapeHTML(table.id)}">M${escapeHTML(table.table_number)} · ${escapeHTML(table.table_name || "Mesa")}</option>`).join("");
+    const previousFrom = from.value;
+    const previousTo = to.value;
+    from.innerHTML = options || '<option value="">Sin mesas</option>';
+    to.innerHTML = options || '<option value="">Sin mesas</option>';
+    if (validIds.has(previousFrom)) from.value = previousFrom;
+    if (validIds.has(previousTo)) to.value = previousTo;
+    else if (tables.length) to.value = String(tables[tables.length - 1].id);
+    selector.innerHTML = tables.length
+      ? tables.map((table) => `
+          <label class="outdoor-table-option">
+            <input type="checkbox" data-outdoor-table="${escapeHTML(table.id)}" ${state.outdoorTableDraftIds.has(String(table.id)) ? "checked" : ""}>
+            <span>${icon("armchair", 16)} M${escapeHTML(table.table_number)}</span>
+          </label>`).join("")
+      : emptyState("Sin mesas", "Crea una mesa para poder asignar su ubicación.", "armchair");
+    const status = $("#tableZoneSettingStatus");
+    if (status) {
+      const count = state.outdoorTableDraftIds.size;
+      status.textContent = count
+        ? `${count} mesa${count === 1 ? "" : "s"} marcada${count === 1 ? "" : "s"} como afuera. Las demás se consideran de adentro.`
+        : "Todas las mesas están configuradas como mesas de adentro.";
+    }
+    refreshIcons();
+  };
+
+  const runRefreshAction = async (button, action, successMessage) => {
+    if (!button || button.disabled) return false;
+    const markup = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = `${icon("loader-circle", 17)} Actualizando...`;
+    refreshIcons();
+    try {
+      const refreshed = await action();
+      if (refreshed) toast(successMessage, "ok");
+      else if (!navigator.onLine) toast("Información local actualizada. Los cambios pendientes se sincronizarán al volver la conexión.", "ok");
+      else toast("No fue posible completar la actualización. La información visible se conservó.", "error", `refresh-failed:${button.id}`);
+      return Boolean(refreshed);
+    } catch (error) {
+      console.error(error);
+      toast("No fue posible completar la actualización. La información visible se conservó.", "error", `refresh-failed:${button.id}`);
+      return false;
+    } finally {
+      button.disabled = false;
+      button.innerHTML = markup;
+      refreshIcons();
+    }
+  };
+
   const renderBusinessForm = () => {
     const form = $("#businessForm");
     if (!form) return;
@@ -3838,6 +3956,7 @@ const App = (() => {
       if (status) status.textContent = hasImage ? "Imagen cargada" : "Seleccionar imagen";
       box?.classList.toggle("has-file", hasImage);
     });
+    renderOutdoorTableConfigurator();
   };
 
   const renderTableManager = () => {
@@ -4159,6 +4278,7 @@ const App = (() => {
   const renderMenuManager = () => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
+      const selectedValue = select.value;
       const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
       const categories = select.closest("#inventoryForm")
         ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name)))
@@ -4167,6 +4287,7 @@ const App = (() => {
         <option value="">Elegir categoria</option>
         ${categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
       `;
+      if ([...select.options].some((option) => option.value === selectedValue)) select.value = selectedValue;
     });
 
     renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
@@ -4257,6 +4378,28 @@ const App = (() => {
       <span><small>Venta potencial</small><strong>${money(sale * stock)}</strong></span>`;
   };
 
+  const renderInventoryCategoryFilter = () => {
+    const select = $("#inventoryCategoryFilter");
+    if (!select) return;
+    const categories = [...state.categories]
+      .filter((category) => category?.id && state.items.some((item) => String(item.category_id || "") === String(category.id)))
+      .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0) || String(left.name || "").localeCompare(String(right.name || ""), "es"));
+    const validIds = new Set(categories.map((category) => String(category.id)));
+    const hasUncategorized = state.items.some((item) => !item.category_id);
+    if (state.inventoryCategoryFilter !== "all"
+      && state.inventoryCategoryFilter !== "uncategorized"
+      && !validIds.has(String(state.inventoryCategoryFilter))) {
+      state.inventoryCategoryFilter = "all";
+    }
+    if (state.inventoryCategoryFilter === "uncategorized" && !hasUncategorized) state.inventoryCategoryFilter = "all";
+    select.innerHTML = [
+      '<option value="all">Todas</option>',
+      ...categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name || "Sin categoría")}</option>`),
+      ...(hasUncategorized ? ['<option value="uncategorized">Sin categoría</option>'] : [])
+    ].join("");
+    select.value = state.inventoryCategoryFilter;
+  };
+
   const renderInventory = () => {
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
@@ -4268,9 +4411,12 @@ const App = (() => {
       <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Antes de gastos</small></article>
       <article class="${summary.low || summary.out ? "inventory-alert-metric" : ""}"><span>${icon("triangle-alert", 19)} Alertas</span><strong>${summary.low + summary.out}</strong><small>${summary.out} agotados · ${summary.low} por reponer</small></article>`;
 
+    renderInventoryCategoryFilter();
     const query = state.inventorySearch;
     const products = matchingProducts(query, { includeUnavailable: true })
-      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter);
+      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter)
+      .filter((item) => state.inventoryCategoryFilter === "all"
+        || (state.inventoryCategoryFilter === "uncategorized" ? !item.category_id : String(item.category_id || "") === String(state.inventoryCategoryFilter)));
     list.innerHTML = products.length
       ? products.map((item) => {
           const inventory = inventoryFor(item);
@@ -4328,12 +4474,39 @@ const App = (() => {
     refreshIcons();
   };
 
+  const pendingInventoryMovementIds = () => {
+    const ids = new Set();
+    readAppsScriptOutbox().forEach((job) => {
+      if (job.action === "adjust_inventory" && job.payload?.adjustment?.eventId) {
+        ids.add(String(job.payload.adjustment.eventId));
+      }
+      if (job.action === "upsert_inventory" && job.payload?.item?.movementEventId) {
+        ids.add(String(job.payload.item.movementEventId));
+      }
+      if (job.action === "record_sale" && job.payload?.invoice) {
+        const invoice = job.payload.invoice;
+        const saleId = String(invoice.id || invoice.sessionId || "");
+        (invoice.items || []).forEach((line) => {
+          if (saleId && line.menu_item_id) ids.add(`SALE-${saleId}-${line.menu_item_id}`);
+        });
+      }
+    });
+    return ids;
+  };
+
   const loadInventoryMovements = async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) {
+      renderInventoryMovements();
+      return true;
+    }
     try {
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
-      if (!result?.ok || !Array.isArray(result.movements)) return false;
-      const merged = new Map(state.inventoryMovements.map((movement) => [movement.movementId, movement]));
+      if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "El historial remoto devolvió una respuesta inválida.");
+      const pendingIds = pendingInventoryMovementIds();
+      const merged = new Map(state.inventoryMovements
+        .filter((movement) => pendingIds.has(String(movement.movementId || "")))
+        .map((movement) => [movement.movementId, movement]));
       result.movements.forEach((movement) => merged.set(movement.movementId, movement));
       state.inventoryMovements = Array.from(merged.values()).slice(-3000);
       persistInventoryMovements();
@@ -4408,11 +4581,11 @@ const App = (() => {
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
-      const newCategoryId = uid();
-      const category = await db(state.sb.from("menu_categories").insert({ id: newCategoryId, name: newCategory, is_active: true }).select("*").single(), null);
-      if (!category) return;
-      state.categories = [...state.categories, category];
-      categoryId = category.id;
+      categoryId = uid();
+      const localCategory = { id: categoryId, name: newCategory, sort_order: 0, is_active: true, updated_at: new Date().toISOString(), _offline_pending: true };
+      state.categories = [...state.categories, localCategory];
+      persistBootstrapCache();
+      void retryQuiet(() => state.sb.from("menu_categories").insert({ id: categoryId, name: newCategory, sort_order: 0, is_active: true }).select("*").single(), 4);
     }
     const payload = {
       category_id: categoryId || null,
@@ -4425,20 +4598,19 @@ const App = (() => {
     };
     const recordId = id || uid();
     const existingItem = id ? state.items.find((item) => item.id === id) : null;
-    let saveQuery = id
-      ? state.sb.from("menu_items").update(payload).eq("id", id)
-      : state.sb.from("menu_items").insert({ ...payload, id: recordId });
-    if (id && existingItem?.updated_at && !existingItem._offline_pending) {
-      saveQuery = saveQuery.eq("updated_at", existingItem.updated_at);
-    }
-    const saved = await db(saveQuery.select("*").single(), null);
-    if (!saved) return;
     const category = state.categories.find((entry) => entry.id === categoryId);
-    const hydrated = { ...saved, menu_categories: category ? { name: category.name } : null };
+    const hydrated = {
+      ...(existingItem || {}),
+      ...payload,
+      id: recordId,
+      menu_categories: category ? { name: category.name } : null,
+      updated_at: new Date().toISOString(),
+      _offline_pending: true
+    };
     state.items = id
       ? state.items.map((item) => item.id === id ? hydrated : item)
       : [...state.items, hydrated];
-    state.inventoryMeta[saved.id] = {
+    state.inventoryMeta[recordId] = {
       code: (form.product_code.value.trim() || productAcronym(name)).toUpperCase(),
       costPrice,
       stock,
@@ -4449,7 +4621,7 @@ const App = (() => {
     };
     const beforeStock = Number(previousInventory?.stock || 0);
     const stockDelta = stock - beforeStock;
-    const movementEventId = (!id || stockDelta) ? `product:${saved.id}:${Date.now()}` : "";
+    const movementEventId = (!id || stockDelta) ? `product:${recordId}:${Date.now()}` : "";
     if (movementEventId) {
       recordLocalInventoryMovement({
         eventId: movementEventId,
@@ -4473,6 +4645,19 @@ const App = (() => {
     renderMenuManager();
     renderInventory();
     toast(id ? "Producto e inventario actualizados." : "Producto agregado al inventario.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        const query = id
+          ? state.sb.from("menu_items").update(payload).eq("id", recordId)
+          : state.sb.from("menu_items").insert({ ...payload, id: recordId });
+        return query.select("*").single();
+      }, 4);
+      if (!saved) return;
+      state.items = state.items.map((item) => item.id === recordId
+        ? { ...saved, menu_categories: saved.menu_categories || hydrated.menu_categories }
+        : item);
+      persistBootstrapCache();
+    })();
   };
 
   const renderInventoryAdjustmentPreview = () => {
@@ -4705,18 +4890,33 @@ const App = (() => {
   };
 
   const mergeIncomeReport = (remote, filters) => {
-    const remoteKeys = new Set(remote.recordKeys || (remote.records || []).map((record) => record.saleId));
-    const pending = localIncomeRecords(filters).filter((record) => !remoteKeys.has(record.saleId));
+    const jobs = readAppsScriptOutbox();
+    const pendingSaleIds = new Set(jobs
+      .filter((job) => ["record_sale", "edit_sale"].includes(job.action))
+      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || ""))
+      .filter(Boolean));
+    const deletedSaleIds = new Set(jobs
+      .filter((job) => job.action === "delete_sale")
+      .map((job) => String(job.payload?.saleId || ""))
+      .filter(Boolean));
+    const excludedRemote = (remote.records || []).filter((record) => deletedSaleIds.has(String(record.saleId || "")) || pendingSaleIds.has(String(record.saleId || "")));
+    const visibleRemote = (remote.records || []).filter((record) => !deletedSaleIds.has(String(record.saleId || "")) && !pendingSaleIds.has(String(record.saleId || "")));
+    const pending = localIncomeRecords(filters)
+      .filter((record) => pendingSaleIds.has(String(record.saleId || "")));
     const pendingTotals = incomeTotalsFromRecords(pending);
+    const excludedTotals = incomeTotalsFromRecords(excludedRemote);
     const totals = { ...(remote.totals || {}) };
-    Object.keys(pendingTotals).forEach((key) => { totals[key] = Number(totals[key] || 0) + (key === "averageTicket" ? 0 : Number(pendingTotals[key] || 0)); });
+    Object.keys(pendingTotals).forEach((key) => {
+      if (key === "averageTicket") return;
+      totals[key] = Number(totals[key] || 0) - Number(excludedTotals[key] || 0) + Number(pendingTotals[key] || 0);
+    });
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
     return {
       ...remote,
       filters,
       totals,
-      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date))),
-      totalRecords: Number(remote.totalRecords || 0) + pending.length,
+      records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
+      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
       pendingCount: pending.length,
       localOnly: false
     };
@@ -4876,6 +5076,12 @@ const App = (() => {
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
       return false;
+    }
+    if (readAppsScriptOutbox().some((job) => job.action === "clear_income")) {
+      state.incomeReport = localIncomeReport(filters);
+      renderIncomeReport();
+      setIncomeReportStatus("Reinicio pendiente de sincronización", "warning", "hard-drive");
+      return true;
     }
     const requestId = ++state.incomeRequestId;
     state.incomeLoading = true;
@@ -5479,8 +5685,37 @@ const App = (() => {
     return true;
   };
 
+  const saveTipSettingsRemotely = async (settings = state.tipSettings) => {
+    const saved = await retryQuiet(
+      () => state.sb.from("business_settings").update({
+        tips_enabled: settings.enabled === true,
+        tip_percentage: Number(settings.percentage || 10)
+      }).eq("is_primary", true).select("*").maybeSingle(),
+      4
+    );
+    if (!saved) return false;
+    state.business = saved;
+    applyBusinessTipSettings();
+    persistBootstrapCache();
+    return true;
+  };
+
+  const saveOutdoorTableZonesRemotely = async (selectedIds) => retryQuiet(
+    () => state.sb.rpc("save_table_zones", {
+      auth_token: state.authToken,
+      outdoor_table_ids: [...selectedIds]
+    }),
+    4
+  );
+
   const saveBusiness = async (form) => {
+    const originalBusiness = state.business ? { ...state.business } : null;
+    const originalTipSettings = { ...state.tipSettings };
+    const originalTables = state.tables.map((table) => ({ ...table }));
     if (!updateTipSettingsFromForm(form, { renderForm: false })) return;
+    const outdoorIds = state.outdoorTableDraftIds instanceof Set
+      ? new Set(state.outdoorTableDraftIds)
+      : new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
     const payload = {
       is_primary: true,
       business_name: form.business_name.value.trim() || "Tu restaurante",
@@ -5488,36 +5723,66 @@ const App = (() => {
       accent_color: form.accent_color.value || "#f05a28",
       currency: DEFAULT_CURRENCY,
       logo_url: form.logo_url.value.trim(),
-      cover_url: form.cover_url.value.trim()
+      cover_url: form.cover_url.value.trim(),
+      tips_enabled: state.tipSettings.enabled === true,
+      tip_percentage: Number(state.tipSettings.percentage || 10)
     };
-    const original = state.business;
-    const businessRecordId = original?.id || uid();
     state.business = { ...(state.business || {}), ...payload };
+    state.tables = state.tables.map((table) => isServicePoint(table)
+      ? table
+      : { ...table, is_outdoor: outdoorIds.has(String(table.id)) });
     persistBootstrapCache();
     renderBrand();
     renderBusinessForm();
-    toast("Marca actualizada. El cliente ya vera esta personalizacion.");
-    void (async () => {
-      const saved = await retryQuiet(
-        () => {
-          if (!original?.id) return state.sb.from("business_settings").insert({ ...payload, id: businessRecordId }).select("*").single();
-          let query = state.sb.from("business_settings").update(payload).eq("id", original.id);
-          if (original.updated_at && !original._offline_pending) query = query.eq("updated_at", original.updated_at);
-          return query.select("*").single();
-        },
-        4
-      );
-      if (saved) {
-        state.business = saved;
-        persistBootstrapCache();
-        return;
+    renderTables();
+    renderServiceTables();
+    const submit = form.querySelector('button[type="submit"]');
+    const submitMarkup = submit?.innerHTML || "";
+    if (submit) {
+      submit.disabled = true;
+      submit.innerHTML = `${icon("loader-circle", 17)} Guardando...`;
+      refreshIcons();
+    }
+    const savedBusiness = await retryQuiet(
+      () => state.sb.from("business_settings").upsert(payload, { onConflict: "is_primary" }).select("*").single(),
+      4
+    );
+    const savedTables = savedBusiness ? await saveOutdoorTableZonesRemotely(outdoorIds) : null;
+    if (submit) {
+      submit.disabled = false;
+      submit.innerHTML = submitMarkup;
+    }
+    if (savedBusiness && savedTables) {
+      state.business = savedBusiness;
+      applyBusinessTipSettings();
+      if (Array.isArray(savedTables.tables)) {
+        const zones = new Map(savedTables.tables.map((table) => [String(table.id), table.is_outdoor === true]));
+        state.tables = state.tables.map((table) => zones.has(String(table.id)) ? { ...table, is_outdoor: zones.get(String(table.id)) } : table);
       }
-      state.business = original;
+      state.outdoorTableDraftIds = new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
+      state.outdoorTableDraftDirty = false;
       persistBootstrapCache();
       renderBrand();
       renderBusinessForm();
-      toast("No se pudo guardar la marca. Se restauro la informacion.", "error", "business-save-failed");
-    })();
+      renderTables();
+      renderServiceTables();
+      toast("Configuración guardada. La marca, la propina y las mesas ya están actualizadas.");
+      refreshIcons();
+      return;
+    }
+    state.business = originalBusiness;
+    state.tipSettings = originalTipSettings;
+    state.tables = originalTables;
+    state.outdoorTableDraftIds = new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
+    state.outdoorTableDraftDirty = false;
+    persistTipSettings();
+    persistBootstrapCache();
+    renderBrand();
+    renderBusinessForm();
+    renderTables();
+    renderServiceTables();
+    toast("No se pudo guardar la configuración. Se restauró la información anterior.", "error", "business-save-failed");
+    refreshIcons();
   };
 
   const uploadAsset = async (file, fieldName) => {
@@ -5578,10 +5843,7 @@ const App = (() => {
       const saved = await retryQuiet(
         () => {
           if (!isUpdate) return state.sb.from("restaurant_tables").insert({ ...payload, id: recordId }).select("*").single();
-          let query = state.sb.from("restaurant_tables").update(payload).eq("id", recordId);
-          const current = original.find((table) => table.id === recordId);
-          if (current?.updated_at && !current._offline_pending) query = query.eq("updated_at", current.updated_at);
-          return query.select("*").single();
+          return state.sb.from("restaurant_tables").update(payload).eq("id", recordId).select("*").single();
         },
         4
       );
@@ -5626,9 +5888,7 @@ const App = (() => {
     void (async () => {
       const saved = await retryQuiet(() => {
         if (!existing) return state.sb.from("menu_categories").insert({ ...payload, id: recordId }).select("*").single();
-        let query = state.sb.from("menu_categories").update(payload).eq("id", recordId);
-        if (existing.updated_at && !existing._offline_pending) query = query.eq("updated_at", existing.updated_at);
-        return query.select("*").single();
+        return state.sb.from("menu_categories").update(payload).eq("id", recordId).select("*").single();
       }, 4);
       if (saved) {
         state.categories = state.categories.map((category) => category.id === recordId ? saved : category);
@@ -5690,9 +5950,7 @@ const App = (() => {
     void (async () => {
       const saved = await retryQuiet(() => {
         if (!existing) return state.sb.from("menu_items").insert({ ...payload, id: recordId }).select("*, menu_categories(name)").single();
-        let query = state.sb.from("menu_items").update(payload).eq("id", recordId);
-        if (existing.updated_at && !existing._offline_pending) query = query.eq("updated_at", existing.updated_at);
-        return query.select("*, menu_categories(name)").single();
+        return state.sb.from("menu_items").update(payload).eq("id", recordId).select("*, menu_categories(name)").single();
       }, 4);
       if (saved) {
         state.items = state.items.map((item) => item.id === recordId
@@ -5955,24 +6213,30 @@ const App = (() => {
       <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
         @page { size: 80mm auto; margin: 3mm; }
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; color: #000; }
         html { display: block; visibility: visible; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
-        body { display: block; visibility: visible; width: 72mm; min-height: 0; margin: 0 auto; padding: 0; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
-        .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
+        body { display: block; visibility: visible; width: 72mm; max-width: 72mm; min-height: 0; margin: 0 auto; padding: 0 3mm; overflow-wrap: anywhere; color: #000; background: #fff; font: 700 10px/1.35 "Courier New", monospace; }
+        strong { color: #000; font-weight: 900; }
+        small { color: #000; font-size: 9px; font-weight: 700; }
+        .logo { margin: 2mm 0 0; text-align: center; font: 900 18px/1 Arial, sans-serif; letter-spacing: .5px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
         .rule { margin: 2.5mm 0; border-top: 1px dashed #000; }
-        .meta, .totals { display: grid; grid-template-columns: 1fr auto; gap: 1mm 3mm; }
+        .meta, .totals { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 1mm 2mm; align-items: start; width: 100%; padding: 0 2mm; }
         .items { display: grid; gap: 2mm; }
-        .item { display: grid; grid-template-columns: 1fr auto; gap: 2mm; }
+        .item { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 2mm; align-items: start; width: 100%; padding: 0 2mm; }
+        .meta > *, .totals > *, .item > * { min-width: 0; }
+        .meta strong { max-width: 30mm; overflow-wrap: anywhere; text-align: right; font-size: 9px; }
+        .totals strong, .item > strong { white-space: nowrap; text-align: right; font-size: 9px; }
         .item small { display: block; }
-        .total { margin-top: 1.5mm; font-size: 16px; font-weight: 900; }
+        .total { margin-top: 1.5mm; font-size: 13px; font-weight: 900; }
+        .totals strong.total { font-size: 12px; }
         .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
         .footer { margin-top: 3mm; text-align: center; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
         @media print {
           html { display: block !important; visibility: visible !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
-          body { display: block !important; visibility: visible !important; width: 72mm !important; min-height: 0 !important; margin: 0 auto !important; padding: 0 !important; overflow: visible !important; }
+          body { display: block !important; visibility: visible !important; width: 72mm !important; max-width: 72mm !important; min-height: 0 !important; margin: 0 auto !important; padding: 0 3mm !important; overflow: visible !important; color: #000 !important; font-weight: 700 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
         }
       </style></head><body>
         <div class="logo">${escapeHTML(businessName)}</div>
@@ -7371,7 +7635,6 @@ const App = (() => {
       menu_items: "items"
     }[table];
     const original = property ? state[property] : null;
-    const originalRow = original?.find((entry) => entry.id === id) || null;
     if (property) state[property] = state[property].filter((entry) => entry.id !== id);
     if (property) persistBootstrapCache();
     if (quickServicePointDelete) renderServicePoints();
@@ -7379,9 +7642,7 @@ const App = (() => {
     void (async () => {
       const removed = await retryQuiet(
         () => {
-          let query = state.sb.from(table).delete().eq("id", id);
-          if (originalRow?.updated_at && !originalRow._offline_pending) query = query.eq("updated_at", originalRow.updated_at);
-          return query.select("*").single();
+          return state.sb.from(table).delete().eq("id", id).select("*").single();
         },
         4
       );
@@ -7410,14 +7671,30 @@ const App = (() => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
     });
-    $("#businessForm")?.addEventListener("change", (event) => {
+    $("#businessForm")?.addEventListener("change", async (event) => {
       if (event.target.name === "tips_enabled") {
+        const previous = { ...state.tipSettings };
         if (updateTipSettingsFromForm(event.currentTarget, { toggleChanged: true })) {
-          toast(state.tipSettings.enabled ? `Propina voluntaria activada al ${state.tipSettings.percentage}%.` : "Propina voluntaria desactivada.");
+          const desired = { ...state.tipSettings };
+          if (await saveTipSettingsRemotely(desired)) {
+            toast(desired.enabled ? `Propina voluntaria activada al ${desired.percentage}% en todos los dispositivos.` : "Propina voluntaria desactivada en todos los dispositivos.");
+          } else {
+            state.tipSettings = previous;
+            persistTipSettings();
+            renderBusinessForm();
+            syncTipFeatureVisibility();
+            toast("No se pudo guardar la propina. Se restauró la configuración anterior.", "error", "tip-save-failed");
+          }
         }
       }
       if (event.target.name === "tip_percentage" && !event.currentTarget.tips_enabled.checked) {
-        updateTipSettingsFromForm(event.currentTarget);
+        const previous = { ...state.tipSettings };
+        if (updateTipSettingsFromForm(event.currentTarget) && !await saveTipSettingsRemotely({ ...state.tipSettings })) {
+          state.tipSettings = previous;
+          persistTipSettings();
+          renderBusinessForm();
+          toast("No se pudo guardar el porcentaje. Se restauró el valor anterior.", "error", "tip-percentage-save-failed");
+        }
       }
     });
     $("#tipSplitPeople")?.addEventListener("input", (event) => {
@@ -7497,6 +7774,18 @@ const App = (() => {
     $("#inventoryStatusFilter")?.addEventListener("change", (event) => {
       state.inventoryStatusFilter = event.currentTarget.value || "all";
       renderInventory();
+    });
+    $("#inventoryCategoryFilter")?.addEventListener("change", (event) => {
+      state.inventoryCategoryFilter = event.currentTarget.value || "all";
+      renderInventory();
+    });
+    $("#dashboardTableZoneFilter")?.addEventListener("change", (event) => {
+      state.dashboardTableZoneFilter = event.currentTarget.value || "all";
+      renderTables();
+    });
+    $("#serviceTableZoneFilter")?.addEventListener("change", (event) => {
+      state.serviceTableZoneFilter = event.currentTarget.value || "all";
+      renderServiceTables();
     });
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;
@@ -7695,6 +7984,15 @@ const App = (() => {
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
     document.addEventListener("change", async (event) => {
+      if (event.target.matches("[data-outdoor-table]")) {
+        if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+        const id = String(event.target.dataset.outdoorTable || "");
+        if (event.target.checked) state.outdoorTableDraftIds.add(id);
+        else state.outdoorTableDraftIds.delete(id);
+        state.outdoorTableDraftDirty = true;
+        renderOutdoorTableConfigurator();
+        return;
+      }
       if (event.target.matches("[data-user-access]")) {
         await toggleUserAccess(event.target.dataset.userAccess, event.target.checked, event.target);
         return;
@@ -7764,25 +8062,56 @@ const App = (() => {
       if (target.id === "selectAllTableQrs") {
         setAllQrSelections(true);
       }
+      if (target.id === "selectOutdoorRange" || target.id === "clearOutdoorRange") {
+        const fromId = $("#outdoorTableFrom")?.value || "";
+        const toId = $("#outdoorTableTo")?.value || "";
+        const ordered = normalTables()
+          .filter((table) => table.is_active !== false)
+          .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+        const fromIndex = ordered.findIndex((table) => String(table.id) === String(fromId));
+        const toIndex = ordered.findIndex((table) => String(table.id) === String(toId));
+        if (fromIndex >= 0 && toIndex >= 0) {
+          if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+          const first = Math.min(fromIndex, toIndex);
+          const last = Math.max(fromIndex, toIndex);
+          ordered.slice(first, last + 1).forEach((table) => {
+            if (target.id === "selectOutdoorRange") state.outdoorTableDraftIds.add(String(table.id));
+            else state.outdoorTableDraftIds.delete(String(table.id));
+          });
+          state.outdoorTableDraftDirty = true;
+          renderOutdoorTableConfigurator();
+        }
+      }
       if (target.id === "clearTableQrs") {
         setAllQrSelections(false);
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
-        await syncInventoryWithAppsScript();
-        await flushAppsScriptOutbox();
+        await runRefreshAction(target, async () => {
+          const flushed = await flushAppsScriptOutbox();
+          if (!flushed || readAppsScriptOutbox().length) return false;
+          const coreRefreshed = await refreshCoreNow();
+          const inventoryRefreshed = await syncInventoryWithAppsScript();
+          return coreRefreshed && inventoryRefreshed;
+        }, "Inventario actualizado con la información más reciente.");
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await loadIncomeReport();
+      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => (await loadIncomeReport()) || !navigator.onLine, "Ingresos actualizados.");
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
         resetInventoryForm();
         $("#inventoryDialog")?.close();
       }
-      if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
+      if (target.id === "refreshInventoryMovements") await runRefreshAction(target, async () => {
+        if (!navigator.onLine) {
+          renderInventoryMovements();
+          return true;
+        }
+        return loadInventoryMovements();
+      }, "Movimientos actualizados desde la fuente oficial.");
       if (target.dataset.resetSection) {
         await resetSectionData(target.dataset.resetSection);
         return;

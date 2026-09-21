@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.7.0",
+  version: "2.8.0",
   spreadsheetId: "1DEt5o9j2yWqA_IBsT-lleOs6Ky4bn77KgClZVcz_n5A",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -183,6 +183,10 @@ function apiRequest(payloadText) {
       requireAdmin_(user);
       result = clearInventoryMovements_(user);
     }
+    else if (request.action === "delete_inventory_movement") {
+      requireAdmin_(user);
+      result = deleteInventoryMovement_(payload.movementId, user);
+    }
     else if (request.action === "clear_income") {
       requireAdmin_(user);
       result = clearIncome_(user);
@@ -332,28 +336,30 @@ function getInventory_() {
   return { items: items, syncedAt: new Date().toISOString() };
 }
 
+function inventoryMovementRowToObject_(row) {
+  return {
+    movementId: String(row[0] || ""),
+    productId: String(row[1] || ""),
+    code: String(row[2] || ""),
+    product: String(row[3] || "Producto"),
+    type: String(row[4] || "MOVIMIENTO"),
+    delta: asNumber_(row[5]),
+    before: asNumber_(row[6]),
+    after: asNumber_(row[7]),
+    unitCost: asNumber_(row[8]),
+    reference: String(row[9] || row[10] || ""),
+    sessionId: String(row[10] || ""),
+    date: row[11] instanceof Date ? row[11].toISOString() : String(row[11] || ""),
+    user: String(row[12] || "Sistema")
+  };
+}
+
 function getInventoryMovements_(requestedLimit) {
   var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
   var rows = readSheetRows_(sheet, HEADERS.movements.length);
   var limit = Math.min(2000, Math.max(50, asNumber_(requestedLimit) || 800));
   return {
-    movements: rows.slice(-limit).map(function (row) {
-      return {
-        movementId: String(row[0] || ""),
-        productId: String(row[1] || ""),
-        code: String(row[2] || ""),
-        product: String(row[3] || "Producto"),
-        type: String(row[4] || "MOVIMIENTO"),
-        delta: asNumber_(row[5]),
-        before: asNumber_(row[6]),
-        after: asNumber_(row[7]),
-        unitCost: asNumber_(row[8]),
-        reference: String(row[9] || row[10] || ""),
-        sessionId: String(row[10] || ""),
-        date: row[11] instanceof Date ? row[11].toISOString() : String(row[11] || ""),
-        user: String(row[12] || "Sistema")
-      };
-    })
+    movements: rows.slice(-limit).map(inventoryMovementRowToObject_)
   };
 }
 
@@ -686,13 +692,87 @@ function clearInventory_(user, authToken) {
   });
 }
 
+function reverseInventoryMovementRows_(inventory, movementRows, marker) {
+  var deltasByProduct = {};
+  movementRows.forEach(function (movement) {
+    var productId = String(movement[1] || "");
+    if (!productId) return;
+    deltasByProduct[productId] = asNumber_(deltasByProduct[productId]) + asNumber_(movement[5]);
+  });
+  Object.keys(deltasByProduct).forEach(function (productId) {
+    var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
+    if (inventoryIndex < 0) return;
+    var row = inventory.rows[inventoryIndex];
+    if (String(row[11] || "") === marker) return;
+    var restoredStock = asNumber_(row[7]) - asNumber_(deltasByProduct[productId]);
+    if (restoredStock < 0) {
+      throw new Error("No se puede borrar el movimiento porque dejaría existencias negativas de " + String(row[2] || "un producto") + ".");
+    }
+    row[7] = restoredStock;
+    row[10] = new Date().toISOString();
+    row[11] = marker;
+    row[12] = asNumber_(row[12]) + 1;
+    inventory.rows[inventoryIndex] = row;
+  });
+}
+
+function deleteInventoryMovement_(movementIdValue, user) {
+  var movementId = String(movementIdValue || "").trim();
+  if (!movementId) throw new Error("Movimiento de inventario inválido.");
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_();
+    var movementsSheet = spreadsheet.getSheetByName(APP.sheets.movements);
+    var movements = readSheetRows_(movementsSheet, HEADERS.movements.length);
+    var movement = null;
+    var remaining = movements.filter(function (row) {
+      if (String(row[0] || "") === movementId) {
+        movement = row;
+        return false;
+      }
+      return true;
+    });
+    var inventory = readInventoryTable_();
+    if (!movement) {
+      var alreadyDeleted = inventory.rows.some(function (row) {
+        return String(row[11] || "") === "MOVIMIENTO_ELIMINADO " + movementId;
+      });
+      return {
+        deleted: alreadyDeleted,
+        duplicate: alreadyDeleted,
+        movementId: movementId,
+        items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_)
+      };
+    }
+    reverseInventoryMovementRows_(inventory, [movement], "MOVIMIENTO_ELIMINADO " + movementId);
+    writeInventoryRows_(inventory.sheet, inventory.rows);
+    writeDataRows_(movementsSheet, remaining, HEADERS.movements.length);
+    appendAudit_("INVENTORY_MOVEMENT_DELETE", movementId, user.full_name || user.username, "OK", "Movimiento eliminado y existencia restaurada.");
+    return {
+      deleted: true,
+      movementId: movementId,
+      movements: remaining.slice(-800).map(inventoryMovementRowToObject_),
+      items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_)
+    };
+  });
+}
+
 function clearInventoryMovements_(user) {
   return withScriptLock_(function () {
-    var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
-    var deleted = Math.max(0, sheet.getLastRow() - 1);
+    var spreadsheet = getSpreadsheet_();
+    var sheet = spreadsheet.getSheetByName(APP.sheets.movements);
+    var movements = readSheetRows_(sheet, HEADERS.movements.length);
+    var inventory = readInventoryTable_();
+    var marker = "MOVIMIENTOS_REINICIADOS " + hash_(movements.map(function (row) { return String(row[0] || ""); }).join("|"));
+    reverseInventoryMovementRows_(inventory, movements, marker);
+    writeInventoryRows_(inventory.sheet, inventory.rows);
     writeDataRows_(sheet, [], HEADERS.movements.length);
-    appendAudit_("INVENTORY_MOVEMENTS_CLEAR_ALL", String(deleted), user.full_name || user.username, "OK", "Historial de movimientos reiniciado desde el panel.");
-    return { cleared: true, deleted: deleted, movements: [] };
+    appendAudit_("INVENTORY_MOVEMENTS_CLEAR_ALL", String(movements.length), user.full_name || user.username, "OK", "Historial eliminado y existencias restauradas.");
+    return {
+      cleared: true,
+      deleted: movements.length,
+      movements: [],
+      items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_)
+    };
   });
 }
 

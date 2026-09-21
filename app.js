@@ -13,9 +13,9 @@ try { SUPABASE_CONFIG.url = new URL(String(SUPABASE_CONFIG.url || "").trim()).or
 
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbxMzNB5IrnCvJyuJGqbPC-f0NFMqYnTumJIWahelbMv0ubZzR4RCKheXjLFODj4Tl2L/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbz6Wj_oZuRwqE8v-TJvlViaJB_l836NrT76pNwM5E7i9CW72aZmPezHgoYkYLVinBm1/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.7.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.8.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
 
 const isAppsScriptVersionCompatible = (version) => {
@@ -4601,7 +4601,7 @@ const App = (() => {
     list.innerHTML = movements.length ? movements.map((movement) => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
-      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
+      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><span><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></span><button class="icon-btn danger" type="button" data-delete-movement="${escapeHTML(movement.movementId)}" aria-label="Eliminar movimiento y restaurar existencias">${icon("trash-2", 16)}</button></div></article>`;
     }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
     refreshIcons();
   };
@@ -5241,6 +5241,38 @@ const App = (() => {
     }
   };
 
+  const restoreLocalInventoryForMovements = (movements = []) => {
+    const deltasByProduct = new Map();
+    movements.forEach((movement) => {
+      const productId = String(movement.productId || "");
+      if (!productId) return;
+      deltasByProduct.set(productId, Number(deltasByProduct.get(productId) || 0) + Number(movement.delta ?? movement.quantityChange ?? 0));
+    });
+    const updates = [];
+    deltasByProduct.forEach((delta, productId) => {
+      const item = state.items.find((entry) => String(entry.id) === productId);
+      if (!item) return;
+      const current = inventoryFor(item);
+      const restoredStock = current.stock - delta;
+      if (restoredStock < 0) {
+        throw new Error(`No se puede eliminar el movimiento porque dejaría existencias negativas de ${item.name || "un producto"}.`);
+      }
+      updates.push({ item, current, restoredStock });
+    });
+    const updatedAt = new Date().toISOString();
+    updates.forEach(({ item, current, restoredStock }) => {
+      state.inventoryMeta[item.id] = {
+        ...current,
+        stock: restoredStock,
+        updatedAt,
+        version: current.version === null ? null : Number(current.version || 0) + 1
+      };
+    });
+    persistInventoryStore();
+    renderInventory();
+    renderMenuManager();
+  };
+
   const resetSectionData = async (section) => {
     if (state.currentUser?.role !== "admin") return;
     const settings = {
@@ -5254,9 +5286,9 @@ const App = (() => {
       movements: {
         eyebrow: "Reiniciar movimientos",
         title: "¿Eliminar todos los movimientos?",
-        message: "Se borrará todo el historial de entradas y salidas. Las existencias actuales no cambiarán.",
+        message: "Se borrará todo el historial de entradas y salidas y cada cambio se revertirá en las existencias.",
         action: "clear_inventory_movements",
-        success: "Movimientos eliminados. El historial quedó en cero."
+        success: "Movimientos eliminados y existencias restauradas."
       },
       income: {
         eyebrow: "Reiniciar ingresos",
@@ -5314,6 +5346,7 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        restoreLocalInventoryForMovements(state.inventoryMovements);
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -5349,8 +5382,12 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        state.inventoryMeta = snapshot.inventoryMeta;
         state.inventoryMovements = snapshot.inventoryMovements;
+        persistInventoryStore();
         persistInventoryMovements();
+        renderInventory();
+        renderMenuManager();
         renderInventoryMovements();
       }
       if (section === "income") {
@@ -5839,6 +5876,41 @@ const App = (() => {
     }),
     4
   );
+
+  const deleteInventoryMovement = async (movementId) => {
+    if (state.currentUser?.role !== "admin") return;
+    const movement = state.inventoryMovements.find((entry) => String(entry.movementId) === String(movementId));
+    if (!movement) return;
+    const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
+    const restoredChange = -delta;
+    const confirmed = await askForConfirmation({
+      eyebrow: "Eliminar movimiento",
+      title: `¿Eliminar el movimiento de ${movement.product || "este producto"}?`,
+      message: `El historial se eliminará y el inventario se ajustará ${restoredChange >= 0 ? "+" : ""}${restoredChange.toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades para restaurar el cambio.`,
+      accept: "Sí, eliminar y restaurar",
+      cancel: "Conservar movimiento"
+    });
+    if (!confirmed) return;
+    const button = $(`[data-delete-movement="${CSS.escape(String(movementId))}"]`);
+    if (button) button.disabled = true;
+    const inventorySnapshot = JSON.parse(JSON.stringify(state.inventoryMeta));
+    try {
+      restoreLocalInventoryForMovements([movement]);
+      state.inventoryMovements = state.inventoryMovements.filter((entry) => String(entry.movementId) !== String(movementId));
+      persistInventoryMovements();
+      renderInventoryMovements();
+      enqueueAppsScriptJob("delete_inventory_movement", { movementId }, `delete-movement:${movementId}`);
+      toast("Movimiento eliminado y existencias restauradas.", "ok", `movement-deleted:${movementId}`);
+    } catch (error) {
+      state.inventoryMeta = inventorySnapshot;
+      persistInventoryStore();
+      renderInventory();
+      renderMenuManager();
+      toast(String(error?.message || error), "error", `movement-delete-failed:${movementId}`);
+    } finally {
+      if (button?.isConnected) button.disabled = false;
+    }
+  };
 
   const saveBusiness = async (form) => {
     const originalBusiness = state.business ? { ...state.business } : null;
@@ -6600,6 +6672,7 @@ const App = (() => {
     if (!localRecord) return;
     if (!state.incomeReport) {
       state.incomeReport = localIncomeReport(filters);
+      if (state.activeAdminSection === "income") renderIncomeReport();
       return;
     }
     const records = [
@@ -6614,6 +6687,7 @@ const App = (() => {
       totalRecords: Math.max(Number(state.incomeReport.totalRecords || 0) + 1, records.length),
       pendingCount: Number(state.incomeReport.pendingCount || 0) + 1
     };
+    if (state.activeAdminSection === "income") renderIncomeReport();
   };
 
   const applyInvoiceToInventory = (invoice) => {
@@ -8231,6 +8305,7 @@ const App = (() => {
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
+      if (target.dataset.deleteMovement) await deleteInventoryMovement(target.dataset.deleteMovement);
       if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => {
         if (!await refreshOperationalDataNow()) return false;
         return (await loadIncomeReport()) || !navigator.onLine;

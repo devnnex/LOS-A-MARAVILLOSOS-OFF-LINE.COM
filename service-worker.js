@@ -1,5 +1,5 @@
-const OFFLINE_CACHE = "los-anos-offline-shell-v7";
-const REMOTE_CACHE = "los-anos-offline-remote-v7";
+const OFFLINE_CACHE = "los-anos-offline-shell-v8";
+const REMOTE_CACHE = "los-anos-offline-remote-v8";
 const OFFLINE_DB = "los-anos-offline-sync-v1";
 const OFFLINE_STORE = "entries";
 const CONFIRMED_RETENTION_MS = 2_000;
